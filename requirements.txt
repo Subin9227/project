@@ -1,0 +1,18 @@
+# 공주비서 2.0 의존성
+# 디스코드 게이트웨이
+discord.py>=2.4
+python-dotenv>=1.0
+
+# LangGraph 에이전트 (도구 호출 루프 + 대화기억을 내장한 create_react_agent)
+langgraph>=0.3
+langgraph-checkpoint-sqlite>=2.0   # SqliteSaver: 채널별 대화기억 저장소
+
+# Claude 모델 어댑터 (기존 anthropic 직접호출을 대체)
+langchain-anthropic>=0.3
+
+# MCP 서버(노션 등)를 LangGraph 도구로 자동 변환
+langchain-mcp-adapters>=0.1
+
+# 노션 File Upload API 직접 호출 + 이미지 압축
+httpx>=0.27
+Pillow>=10.0

@@ -1,1 +1,4 @@
 - [[개인프로젝트] 🎀공주비서🤵🏻‍♂️ 만들기 #1 갈아엎기](https://hwamgai.tistory.com/98)
+
+- [[개인프로젝트] 🎀공주비서🤵🏻‍♂️ 만들기 #2 노션 MCP 연결]
+(https://hwamgai.tistory.com/102)

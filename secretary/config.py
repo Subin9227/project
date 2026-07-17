@@ -36,10 +36,12 @@ DATA_DIR.mkdir(exist_ok=True)  # data/ 폴더가 없으면 자동 생성
 MEMORY_DB_PATH: Path = DATA_DIR / "memory.sqlite"
 
 # --- 노션 (데일리루틴 사진 인증용) ---
-# "오프라인 데일리 루틴" 데이터소스 ID. (개인 워크스페이스, 하루 1행)
+# "오프라인 데일리 루틴 (2)" 데이터소스 ID.
+# ("비서 전용 페이지" 안의 깨끗한 전용 DB. 하루 1행, 스키마는 옛 DB와 동일.)
 # 워크스페이스를 새로 만들면 바뀔 수 있으므로 여기서 한 곳에서 관리한다.
+# (옛 "오프라인 데일리 루틴" = df10ffe9-306d-834e-bae9-0717212de385)
 NOTION_ROUTINE_DS_ID: str = os.getenv(
-    "NOTION_ROUTINE_DS_ID", "df10ffe9-306d-834e-bae9-0717212de385"
+    "NOTION_ROUTINE_DS_ID", "a5a0ffe9-306d-82c0-b5df-07a9145e578b"
 )
 
 # 노션 REST API를 직접 호출할 때 쓰는 상수.

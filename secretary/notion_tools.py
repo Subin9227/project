@@ -232,15 +232,30 @@ async def _upload_to_notion(
 
 # --- 에이전트에 노출되는 도구 ---------------------------------------------
 @tool
-async def attach_routine_photo(item: str, image_url: str, date: str = "today") -> str:
-    """데일리루틴 인증 사진을 노션에 넣고 해당 항목 체크박스를 켠다.
+async def attach_routine_photo(
+    item: str,
+    image_url: str,
+    date: str = "today",
+    check: bool = True,
+    note: str = "",
+) -> str:
+    """데일리루틴 항목에 인증 사진(+선택 메모)을 넣고, 필요하면 체크박스를 켠다.
 
-    사용자가 '데일리 루틴에 운동 완료했어 (사진) 넣어줘' 처럼 요청할 때 쓴다.
+    '사진 = 증거'와 '체크박스 = 달성'은 별개다. 항목을 실제로 달성했으면 체크박스를
+    켜고(check=True), 증거만 남기고 달성은 아닐 때는 사진만 넣는다(check=False).
+
+    예)
+        "운동 인증 사진 넣어줘"            → check=True (달성)
+        "8시 34분 도착이라고 적고 사진 넣어줘, 체크박스는 하지마"
+                                          → item="도착8시", note="8시 34분 도착", check=False
 
     Args:
         item: 인증 항목. 코테 / 도착 8시 / 운동 / 영어 스피킹 / 어드민나잇 / 회고 중 하나.
         image_url: 첨부된 이미지의 URL (디스코드 첨부 URL 등).
         date: 대상 날짜 YYYY-MM-DD. 기본 'today' = 오늘.
+        check: True면 해당 항목 체크박스를 켠다. False면 체크박스를 건드리지 않는다
+            (목표 미달성·증거만 남길 때). 사용자가 달리 말하지 않으면 True.
+        note: 사진 위에 함께 남길 짧은 텍스트(예: "8시 34분 도착"). 비우면 사진만 넣는다.
 
     Returns:
         처리 결과 요약 문자열.
@@ -266,36 +281,51 @@ async def attach_routine_photo(item: str, image_url: str, date: str = "today") -
             data, filename, content_type = await _download_image(client, image_url)
             file_upload_id = await _upload_to_notion(client, data, filename, content_type)
 
-            # 헤딩 바로 뒤에 이미지 블록 삽입
+            # 헤딩 뒤에 넣을 블록을 순서대로 구성: (있으면)메모 문단 → 사진
+            new_blocks: list[dict] = []
+            note_text = note.strip()
+            if note_text:
+                new_blocks.append(
+                    {
+                        "type": "paragraph",
+                        "paragraph": {"rich_text": [{"text": {"content": note_text}}]},
+                    }
+                )
+            new_blocks.append(
+                {
+                    "type": "image",
+                    "image": {
+                        "type": "file_upload",
+                        "file_upload": {"id": file_upload_id},
+                    },
+                }
+            )
             insert = await client.patch(
                 f"{NOTION_API_BASE}/blocks/{row_id}/children",
                 headers=_headers(),
-                json={
-                    "after": heading_id,
-                    "children": [
-                        {
-                            "type": "image",
-                            "image": {
-                                "type": "file_upload",
-                                "file_upload": {"id": file_upload_id},
-                            },
-                        }
-                    ],
-                },
+                json={"after": heading_id, "children": new_blocks},
             )
             insert.raise_for_status()
 
-            # 체크박스 ON
-            check = await client.patch(
-                f"{NOTION_API_BASE}/pages/{row_id}",
-                headers=_headers(),
-                json={"properties": {resolved["checkbox"]: {"checkbox": True}}},
-            )
-            check.raise_for_status()
+            # 체크박스: check=True일 때만 켠다. False면 건드리지 않는다(미달성·증거만).
+            if check:
+                chk = await client.patch(
+                    f"{NOTION_API_BASE}/pages/{row_id}",
+                    headers=_headers(),
+                    json={"properties": {resolved["checkbox"]: {"checkbox": True}}},
+                )
+                chk.raise_for_status()
 
+        # 결과 문구를 실제 수행한 내용에 맞춰 조립
+        did = f"메모('{note_text}')와 사진을" if note_text else "사진을"
+        if check:
+            return (
+                f"{day} 데일리루틴 '{resolved['heading']}'에 {did} 넣고 "
+                f"체크박스를 켰어요. (달성률 자동 갱신됨)"
+            )
         return (
-            f"{day} 데일리루틴 '{resolved['heading']}'에 사진을 넣고 "
-            f"체크박스를 켰어요. (달성률 자동 갱신됨)"
+            f"{day} 데일리루틴 '{resolved['heading']}'에 {did} 넣었어요. "
+            f"체크박스는 켜지 않았어요."
         )
     except httpx.HTTPStatusError as e:
         return f"노션 처리 중 오류가 났어요 ({e.response.status_code}): {e.response.text[:300]}"

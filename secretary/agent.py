@@ -17,7 +17,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import SystemMessage, trim_messages
 from langgraph.prebuilt import create_react_agent
 
 from secretary.config import CLAUDE_MODEL, MAX_TOKENS
@@ -28,6 +28,11 @@ from secretary.tools import load_tools
 # 봇이 어느 서버에서 돌든 날짜 기준은 한국 시간으로 고정한다.
 KST = ZoneInfo("Asia/Seoul")
 _WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
+
+# 모델에 실어 보낼 최근 메시지 개수. 공주비서는 '한 방 명령 실행기'라 긴 대화기억이
+# 필요 없다. 다만 되묻기 한 바퀴(사진 → "어느 항목?" → "운동")는 이어져야 하므로
+# 최소한만 남긴다. (무한 누적 → 토큰 폭증을 막는 핵심 장치)
+RECENT_WINDOW = 3
 
 
 def _prompt_with_today(state):
@@ -46,7 +51,19 @@ def _prompt_with_today(state):
         "사용자가 날짜를 따로 말하지 않으면, 노션 도구를 호출할 때 이 오늘 날짜를 기준으로 삼아. "
         "예전 대화에 나온 날짜에 이끌리지 말 것."
     )
-    return [SystemMessage(content=SYSTEM_PROMPT + today_line), *state["messages"]]
+    # 체크포인터엔 전체 대화가 쌓이지만, 모델에는 최근 RECENT_WINDOW개만 실어 보낸다.
+    #   strategy="last"     : 최신 것부터
+    #   token_counter=len   : 토큰이 아니라 '메시지 개수'로 센다 (max_tokens=개수)
+    #   start_on="human"    : 윈도우가 사람 메시지에서 시작 → 도구호출(tool_use/result) 쌍이 깨지지 않음
+    recent = trim_messages(
+        state["messages"],
+        strategy="last",
+        token_counter=len,
+        max_tokens=RECENT_WINDOW,
+        start_on="human",
+        include_system=False,
+    )
+    return [SystemMessage(content=SYSTEM_PROMPT + today_line), *recent]
 
 
 async def build_agent(checkpointer):

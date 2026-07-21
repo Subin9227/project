@@ -48,11 +48,12 @@ run.py → bot.py main() → agent.py build_agent()
 
 ## 핵심 설계 결정
 
-- 봇 1개 + 웹훅 페르소나(기능별 요원), 내부는 LangGraph
+- 봇 1개(구현) + 내부는 LangGraph **단일 `create_react_agent`**. 웹훅 페르소나 4요원은 **목표(미구현, PLAN §1)** — 팔다리 늘면 리팩터링
+- 웹 대화(`/chat`)·멀티유저는 **안 함/보류** (보안·권한 복잡, PLAN §9). Streamlit은 읽기 전용 조망만
 - 노션: 개인 워크스페이스에 채우고 org(게스트)엔 사용자가 수동 복붙
 - 블레이버스: API 없음 → 자동화 안 함. cron 알림 + 링크만 보내고 클릭은 사용자
 - 도구 전략: 있는 건 MCP, 빠진 건 REST 직접
-- 부트캠프 과제 접목: LoRA→PTQ→GGUF 모델을 봇 1차 라우터로, Wireshark/유닉스는 봇 자체 분석
+- 부트캠프 과제 접목: LoRA→PTQ→GGUF 모델을 봇 1차 라우터로 / OS·네트워크·클라우드 과제는 봇에 얹음 (상세 `PLAN.md` §9)
 
 ## 진행 상황 (작업 로그 — 세션 끝날 때 갱신)
 
@@ -69,7 +70,8 @@ run.py → bot.py main() → agent.py build_agent()
       (07:25 켜 / 11:45 꺼 / 12:58 켜 / 17:48 꺼) + 링크, 밤엔 블라인드 잔소리
     - 하드코딩 페르소나 템플릿 (Claude 호출 없이). .env 필요: `DISCORD_USER_ID`(또는 채널ID) + `BLAVERSE_URL`
 - 🎓 과제 트랙 (2026-07-21 기획): 부트캠프 OS/네트워크·클라우드 과제를 봇에 얹음
-    - Phase 1 서술형5문제 → 2 프로세스/메모리 → 3 `/health`+WireShark → 4 Docker → 5 EC2 → 6 CI/CD
+    - 순서: 2 프로세스/메모리 → 3 `/health`+WireShark → 4 Docker → 5 EC2 → 6 CI/CD
+      (Phase 1 서술형5문제는 스킵. LoRA→GGUF(백로그 ⑦)는 별도 Qwen 모델 필요 → 클라우드 트랙 뒤로 미룸)
     - 핵심 개념: 런타임 파이프라인 ≠ 배포 파이프라인, EC2=실행 장소. `/health`만 파이프라인에 문 추가
     - 상세: `PLAN.md` '9. 과제 트랙'. 한 단계씩 접근안→승인→실행
 - 상세 기획·백로그: `PLAN.md` 참고

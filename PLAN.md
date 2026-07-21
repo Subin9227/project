@@ -106,3 +106,44 @@ SQLite Checkpointer + 웹훅 페르소나 응답
 | ⑤ | 티스토리 반자동 + 인스타 캡션 배달 | 중 | 발행 자동화 |
 | ⑥ | Streamlit 대시보드 | 중 | 조망 |
 | ⑦ | LoRA→PTQ→GGUF 라우터 + Wireshark/유닉스 보고서 | 상 | 과제 시즌 |
+
+---
+
+## 9. 과제 트랙 (부트캠프 OS/네트워크 · 클라우드)
+
+> 2026-07-21 확정. 부트캠프 과제를 **별도 프로젝트가 아니라 이 봇에 얹어서**
+> "과제 제출 = 프로젝트 진척"이 되게 한다. 과제 지문의 "개인 프로젝트"가 곧 이 봇.
+
+### 확정 결정
+- 순서: **이론·로컬 분석 먼저 → 클라우드(Docker/EC2/CICD) 나중** (제출 압박에 유리)
+- WireShark "서버": 봇에 **HTTP 엔드포인트(`/health`) 추가**로 서버 표면 확보
+  (봇은 원래 outbound 클라이언트라 접속받을 문이 없음 → 캡처할 통신을 만들려고 문을 냄)
+- Docker 이미지: **Python + Node 둘 다** (npx 노션 MCP 유지, 코드 변경 최소)
+- 웹 대화(`/chat`)는 **선택** — 과제엔 불필요, 원하면 나중에 agent에 연결
+
+### 개념 정리 (헷갈리기 쉬움)
+- **파이프라인이 두 개다.**
+  - 런타임(요청) 파이프라인: 사용자→디스코드→bot.py→agent→tool. 봇이 켜진 내내 돎.
+  - 배포(CI/CD) 파이프라인: 코드 push→빌드→배포. 코드 올릴 때만 돎.
+- **과제 대부분은 런타임 파이프라인을 안 바꾼다.** `/health`만 파이프라인에 문을 추가하고,
+  WireShark=관찰 / Docker=포장 / EC2=실행 장소 이동 / CI/CD=배포 자동화.
+- **EC2는 파이프라인이 아니라 "장소"**(봇이 도는 클라우드 컴퓨터).
+
+### 단계 (Phase)
+| # | 내용 | 산출물 | 파이프라인 관계 |
+|---|---|---|---|
+| 1 | 서술형 5문제 (User/Kernel·프로세스vs스레드·스케줄링·네트워크계층·패킷손실) | `reports/*.md` | 설명만 |
+| 2 | 프로세스·스레드·메모리 분석 (ps/lsof/vmmap, npx 자식 프로세스) | `reports/process-memory.md` | 관찰 |
+| 3 | `/health` 엔드포인트(FastAPI) + WireShark 캡처 (2대, HTTP/HTTPS) | `secretary/webserver.py`, `reports/wireshark.md` | **입구 추가** |
+| 4 | Dockerfile(Python+Node) + docker-compose | `Dockerfile`, `docker-compose.yml` | 포장 |
+| 5 | EC2 배포 (보안그룹 8000 오픈 → 외부 `/health`) | 외부 접근 증명 | 장소 이동 |
+| 6 | GitHub Actions CI/CD (push→빌드→EC2→`/health` 판정) | `.github/workflows/deploy.yml` | 배포 자동화 |
+
+### 작업 방식
+- **한 단계씩**: 접근안 먼저 제시 → 사용자 승인 → 실행 → 검토.
+- 분업: AI=초안·설명·해석 / 사용자=승인·물리세팅(컴퓨터 2대·AWS)·업로드·커밋.
+- 각 Phase 끝: 보고서 md + CLAUDE.md 진행상황 갱신 + 티스토리 글감.
+
+### 시너지
+- `/health` 하나가 **WireShark·EC2외부접근·CI/CD헬스체크** 3과제를 동시에 해결.
+- Phase 5(EC2) 후 진짜 리눅스가 생기면 Phase 2·3을 리눅스에서 재실행 → 보고서 강화.

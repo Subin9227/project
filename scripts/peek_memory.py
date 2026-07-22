@@ -20,6 +20,7 @@ import argparse
 import json
 import sqlite3
 import sys
+import unicodedata
 from pathlib import Path
 
 # 프로젝트 루트를 import 경로에 넣어 어디서 실행하든 동작하게 한다.
@@ -29,6 +30,55 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer  # noqa: E402
 
 SERDE = JsonPlusSerializer()
 PREVIEW_LEN = 200  # --full 없을 때 메시지 본문을 자를 길이
+REPLY_LEN = 240    # --turns에서 답장을 보여줄 길이
+WRAP_WIDTH = 78    # 답장 줄바꿈 폭 (터미널 칸 기준)
+
+
+def _w(text: str) -> int:
+    """터미널에 찍히는 '칸 수'를 센다.
+
+    한글·이모지는 두 칸을 차지하는데 len()은 1로 세기 때문에, 그대로 ljust()를 쓰면
+    표가 밀린다. 동아시아 문자 폭(W=Wide, F=Fullwidth)을 2로 쳐서 실제 폭을 구한다.
+    """
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
+
+
+def _pad(text: str, width: int) -> str:
+    """표시 폭 기준으로 오른쪽을 공백으로 채운다. (한글 표 정렬용)"""
+    return text + " " * max(0, width - _w(text))
+
+
+def _rpad(text: str, width: int) -> str:
+    """표시 폭 기준으로 왼쪽을 채운다. (숫자 오른쪽 정렬용)"""
+    return " " * max(0, width - _w(text)) + text
+
+
+def _wrap(text: str, width: int) -> list[str]:
+    """표시 폭 기준으로 줄바꿈한다. URL처럼 긴 낱말은 중간에서 끊는다."""
+    lines: list[str] = []
+    current = ""
+    for word in text.split():
+        # 낱말 하나가 이미 한 줄보다 길면(긴 URL 등) 잘라서 흘려보낸다
+        while _w(word) > width:
+            head = ""
+            for ch in word:
+                if _w(head + ch) > width:
+                    break
+                head += ch
+            if current:
+                lines.append(current)
+                current = ""
+            lines.append(head)
+            word = word[len(head):]
+        candidate = word if not current else f"{current} {word}"
+        if _w(candidate) > width and current:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
 
 
 def _load_metadata(type_: str, blob: bytes) -> dict:
@@ -147,11 +197,90 @@ def show_one(db: sqlite3.Connection, needle: str, full: bool) -> None:
             print(f"  task {task_id[:6]} #{idx} [{channel}] {text}")
 
 
+def list_turns(db: sqlite3.Connection, thread: str | None) -> None:
+    """요청(턴) 단위로 묶어서 '어디서 시작해 어디서 끝났는지'를 보여준다.
+
+    경계를 찾는 규칙:
+        - metadata의 source == 'input'  → 새 요청의 시작
+        - 그 직전 행                     → 앞 요청의 마지막(=답장하고 끝난 행)
+        - 마지막 행은 writes(쪽지)가 없다 → 더 할 일이 없다는 뜻
+          쪽지가 남아 있으면 도중에 죽은 것이다.
+    """
+    q = "select thread_id, checkpoint_id, type, checkpoint, metadata from checkpoints"
+    params: tuple = ()
+    if thread:
+        q += " where thread_id = ?"
+        params = (thread,)
+    q += " order by thread_id, checkpoint_id"
+    rows = db.execute(q, params).fetchall()
+    if not rows:
+        print("체크포인트가 없습니다.")
+        return
+
+    # 쪽지가 달린 체크포인트 id 집합 (여기 없으면 = 종료 행)
+    pending = {r[0] for r in db.execute("select distinct checkpoint_id from writes")}
+
+    turns: list[dict] = []
+    for n, (thread_id, cid, type_, cp_blob, md_blob) in enumerate(rows, start=1):
+        cp = SERDE.loads_typed((type_, cp_blob))
+        md = _load_metadata(type_, md_blob)
+        msgs = cp["channel_values"].get("messages", [])
+        info = {
+            "row": n, "thread": thread_id, "cid": cid, "ts": cp["ts"],
+            "msgs": len(msgs), "size": len(cp_blob),
+            "last": msgs[-1] if msgs else None, "done": cid not in pending,
+        }
+        if md.get("source") == "input" or not turns or turns[-1]["start"]["thread"] != thread_id:
+            turns.append({"start": info, "end": info})
+        else:
+            turns[-1]["end"] = info
+
+    # 표시 폭(칸 수) 기준 열 너비. 한글 헤더가 2칸씩 먹는 걸 감안해 넉넉히 잡는다.
+    cols = [("턴", 5), ("행 범위", 12), ("시각(UTC)", 11), ("스냅샷", 8),
+            ("메시지", 8), ("끝 크기", 11), ("상태", 0)]
+
+    current = None
+    for i, t in enumerate(turns, start=1):
+        s, e = t["start"], t["end"]
+        if s["thread"] != current:
+            current = s["thread"]
+            print(f"\n=== thread_id {current} ===")
+            print("".join(_pad(name, w) for name, w in cols))
+            print("-" * (sum(w for _, w in cols) + 12))
+        mark = "✅ 답장함" if e["done"] else "⚠️  도중 중단(쪽지 남음)"
+        cells = [
+            _pad(str(i), cols[0][1]),
+            _pad(f"{s['row']}~{e['row']}", cols[1][1]),
+            _pad(e["ts"][11:19], cols[2][1]),
+            _rpad(str(e["row"] - s["row"] + 1), cols[3][1] - 2) + "  ",
+            _rpad(str(e["msgs"]), cols[4][1] - 2) + "  ",
+            _rpad(f"{e['size']:,}", cols[5][1] - 2) + "  ",
+            mark,
+        ]
+        print("".join(cells))
+
+        if e["last"] is not None:
+            _, text = _describe(e["last"])
+            text = " ".join(text.split())  # 줄바꿈·공백 정리
+            clipped = len(text) > REPLY_LEN
+            body = text[:REPLY_LEN] + (" …(생략)" if clipped else "")
+            head = "     └ 답장: " if e["done"] else "     └ 마지막: "
+            pad = " " * _w(head)
+            for n, line in enumerate(_wrap(body, WRAP_WIDTH)):
+                print((head if n == 0 else pad) + line)
+        print()
+
+    print("\n'끝 크기' = 그 턴 마지막 스냅샷의 checkpoint 바이트. 대화가 쌓일수록 커진다.")
+    print("자세히 보려면: peek_memory.py <id앞자리>")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="공주비서 대화기억(memory.sqlite) 뷰어")
     parser.add_argument("checkpoint", nargs="?", help="체크포인트 id 일부. 생략하면 전체 목록")
     parser.add_argument("--db", default="data/memory.sqlite", help="DB 경로")
     parser.add_argument("--full", action="store_true", help="긴 내용을 자르지 않고 전부 출력")
+    parser.add_argument("--turns", action="store_true", help="요청(턴) 단위로 시작~종료 행 보기")
+    parser.add_argument("--thread", help="특정 thread_id만")
     args = parser.parse_args()
 
     path = Path(args.db)
@@ -163,6 +292,8 @@ def main() -> None:
     try:
         if args.checkpoint:
             show_one(db, args.checkpoint, args.full)
+        elif args.turns:
+            list_turns(db, args.thread)
         else:
             list_all(db)
     finally:

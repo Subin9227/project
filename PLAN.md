@@ -153,9 +153,40 @@ SQLite Checkpointer + 웹훅 페르소나 응답
 | 1 | 서술형 5문제 (User/Kernel·프로세스vs스레드·스케줄링·네트워크계층·패킷손실) | `reports/*.md` | 설명만 |
 | 2 | 프로세스·스레드·메모리 분석 (ps/lsof/vmmap, npx 자식 프로세스) | `reports/process-memory.md` | 관찰 |
 | 3 | `/health` 엔드포인트(FastAPI) + WireShark 캡처 (2대, HTTP/HTTPS) | `secretary/webserver.py`, `reports/wireshark.md` | **입구 추가** |
+
 | 4 | Dockerfile(Python+Node) + docker-compose | `Dockerfile`, `docker-compose.yml` | 포장 |
 | 5 | EC2 배포 (보안그룹 8000 오픈 → 외부 `/health`) | 외부 접근 증명 | 장소 이동 |
 | 6 | GitHub Actions CI/CD (push→빌드→EC2→`/health` 판정) | `.github/workflows/deploy.yml` | 배포 자동화 |
+
+### Phase 3 실행계획 (2026-07-22 확정 — 다음 세션에서 착수)
+
+> Phase 2에서 얻은 사실이 그대로 근거가 된다: 봇은 **LISTEN 소켓이 0개**인 순수 클라이언트라
+> 캡처할 서버 트래픽이 없다. 그래서 `/health`로 문을 낸다. (`reports/process-memory.md` §6.2)
+
+**현재 준비 상태**: WireShark 미설치 / `uvicorn`·`starlette` 설치됨, `fastapi` 없음 /
+Wi-Fi `en0` = `172.30.1.40` / 맥 방화벽 꺼짐(외부 접속 차단 걱정 없음)
+
+**결정**: 웹서버는 **FastAPI**로 간다 (requirements.txt에 추가). `/docs` 자동 문서와 향후 API 확장성 고려.
+
+| 단계 | 내용 | 비고 |
+|---|---|---|
+| 0 | `brew install --cask wireshark` | **사용자 직접** (비밀번호·ChmodBPF 권한, 재로그인 필요할 수 있음) |
+| 1 | `secretary/webserver.py` 신설 — `/health` | **`0.0.0.0:8000` 바인딩 필수**(127.0.0.1이면 외부 접속 불가). 봇과 같은 asyncio 루프에 얹어 프로세스 1개 유지 → Phase 2 관측 스크립트 그대로 재사용. 일부러 평문 HTTP |
+| 2 | 로컬 확인 | `curl localhost:8000/health` + `lsof`로 **LISTEN 소켓 등장** 확인 (Phase 2와의 대비 = 보고서 재료) |
+| 3 | 다른 기기에서 접속 | 폰·노트북에서 `http://172.30.1.40:8000/health`. 같은 Wi-Fi 필수 |
+| 4 | **HTTP 캡처** | `en0`에서 캡처필터 `tcp port 8000`. 3-way 핸드셰이크 → `GET /health` 평문 → `200 OK` → FIN |
+| 5 | **HTTPS 캡처** | 봇의 outbound. Phase 2에서 IP 확정: `api.anthropic.com`=160.79.104.10 / `gateway.discord.gg`=162.159.133.234 / `apac.api.smith.langchain.com`=34.149.149.213 |
+| 6 | `reports/wireshark.md` + `.pcapng` 보관 | |
+
+**보고서 결론 축**: HTTPS는 *내용*을 가리지만 *누구와·언제·얼마나*는 못 가린다
+(TLS ClientHello의 SNI·패킷 크기·타이밍은 그대로 노출). HTTP와 나란히 놓고 대비.
+
+**함정 메모**
+- ⚠️ `localhost` 접속은 랜카드(`en0`)를 안 지나간다(`lo0`) → **캡처가 안 됨.**
+  과제가 "클라이언트는 다른 컴퓨터"를 요구하는 이유.
+- ⚠️ 캡처필터 없이 녹화하면 내 모든 통신이 기록됨 (사생활·용량). 반드시 포트/호스트로 제한.
+- ⚠️ `.pcapng`는 내용 확인 후 커밋 여부 판단 (`reports/`는 gitignore 아님).
+- 두 기기가 2.4G/5G나 게스트망으로 갈리면 3단계에서 실패 → 캡처 전에 먼저 확인.
 
 ### 작업 방식
 - **한 단계씩**: 접근안 먼저 제시 → 사용자 승인 → 실행 → 검토.

@@ -21,6 +21,7 @@ from langgraph.errors import GraphRecursionError
 
 from secretary.agent import build_agent
 from secretary.config import DISCORD_BOT_TOKEN, MEMORY_DB_PATH
+from secretary.webserver import build_health_server
 
 # 디스코드 한 메시지의 최대 길이. 초과분은 잘라서 보낸다.
 DISCORD_MAX_LEN = 2000
@@ -128,5 +129,11 @@ async def main() -> None:
 
             await message.reply(reply_text)
 
-        # 여기서 블로킹: 봇이 종료될 때까지 실행을 유지한다.
-        await client.start(DISCORD_BOT_TOKEN)
+        # 봇(디스코드 게이트웨이)과 상태 서버(/health)를 같은 asyncio 루프에서
+        # 나란히 실행한다. 한 프로세스 안에서 둘 다 돌아가므로 Phase 2 관측
+        # 스크립트를 그대로 재사용할 수 있다. 둘 중 하나라도 끝나면 gather가 반환된다.
+        health_server = build_health_server()
+        await asyncio.gather(
+            client.start(DISCORD_BOT_TOKEN),
+            health_server.serve(),
+        )

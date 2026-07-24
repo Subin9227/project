@@ -16,3 +16,7 @@ langchain-mcp-adapters>=0.1
 # 노션 File Upload API 직접 호출 + 이미지 압축
 httpx>=0.27
 Pillow>=10.0
+
+# 상태 서버(/health) — Phase 3 WireShark 캡처용. 봇과 같은 asyncio 루프에서 실행.
+fastapi>=0.110
+uvicorn>=0.30

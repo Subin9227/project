@@ -65,7 +65,17 @@ run.py → bot.py main() → agent.py build_agent()
     - 새 전용 DB로 이전 (config.py — 아래 '노션 연결' 참고)
     - LangSmith 관측 연결 (.env, 엔드포인트 apac)
     - 대화기억 최근 3개 윈도우 + 애매하면 되묻기 (agent.py `trim_messages`, persona.py)
-- ⏭️ 다음: #4 블레이버스 + 오프라인 알람 (설계 이미 끝남)
+- 2026-07-22  과제 트랙 **Phase 2 완료** (프로세스·스레드·메모리) → `reports/process-memory.md`
+    - 관측 스크립트 2종 신설 (읽기 전용, 봇 코드와 무관):
+      `scripts/inspect_process.sh`(A/B/C 스냅샷) · `scripts/watch_children.sh`(0.2초 감시)
+    - npx 자식 프로세스 **생성→소멸 포착**: 봇→`npm exec`→`node` 2단 트리, 호출당 1쌍·수명 1~2초
+      (스냅샷으론 안 잡힘 — 수명이 짧아 0.2초 감시 루프가 필요했음)
+    - 소켓 3개 정체 확정: discord gateway / api.anthropic.com / apac.api.smith.langchain.com
+      **LISTEN 없음** = 봇은 클라이언트 → Phase 3에서 `/health`로 문 내야 하는 근거
+    - ⚠️ `ps -E`·`/proc/environ` **금지** (환경변수=토큰 덤프됨. `reports/`는 gitignore 아님)
+    - 곁가지 버그 수정: `trim_messages` 창이 도구 2회+ 호출 시 빈 목록 → `BadRequestError`
+      (`agent.py`) — 자르는 단위를 '메시지 개수'→'대화 턴'으로. `RECENT_WINDOW` 3→2
+- ⏭️ 다음: **Phase 3** (`/health` + WireShark 2대 캡처). 그 후 #4 블레이버스 + 오프라인 알람
     - `alarms.py` 신설 + `discord.ext.tasks`, 하루 4번 토글 DM
       (07:25 켜 / 11:45 꺼 / 12:58 켜 / 17:48 꺼) + 링크, 밤엔 블라인드 잔소리
     - 하드코딩 페르소나 템플릿 (Claude 호출 없이). .env 필요: `DISCORD_USER_ID`(또는 채널ID) + `BLAVERSE_URL`

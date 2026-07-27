@@ -52,5 +52,15 @@ NOTION_VERSION: str = os.getenv("NOTION_VERSION", "2025-09-03")
 # 무료 플랜 파일 업로드 상한 (5MB). 이보다 크면 압축한다.
 NOTION_MAX_UPLOAD_BYTES: int = 5 * 1024 * 1024
 
+# --- 상태 서버 (/health) — Phase 3 WireShark 캡처용 ---
+# 봇은 원래 바깥으로만 나가는 클라이언트라 접속받을 '문'이 없다.
+# 캡처할 서버 트래픽을 만들려고 /health 엔드포인트를 연다. (PLAN.md §9)
+#
+# HEALTH_HOST = 0.0.0.0 : 모든 랜카드로 들어오는 접속을 받는다 → 폰 등 외부 기기가 붙을 수 있다.
+#   127.0.0.1로 두면 맥 자기 자신만 접속 가능 → localhost는 랜카드(en0)를 안 지나
+#   WireShark 캡처가 안 된다(과제가 '다른 컴퓨터'를 요구하는 이유).
+HEALTH_HOST: str = os.getenv("HEALTH_HOST", "0.0.0.0")
+HEALTH_PORT: int = int(os.getenv("HEALTH_PORT", "8000"))
+
 # langchain-anthropic(ChatAnthropic)은 ANTHROPIC_API_KEY 환경변수를 자동으로 읽는다.
 # load_dotenv()가 이미 올려놨으므로 별도 전달은 필요 없다.

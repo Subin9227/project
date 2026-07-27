@@ -10,3 +10,10 @@ tmp-*/
 
 .artifacts/
 data/
+
+# WireShark 캡처 파일 (Phase 3). 크고 바이너리 + 실제 트래픽 메타데이터 → 커밋 금지.
+# 보고서(reports/*.md)는 텍스트라 커밋 OK, 원본 캡처만 제외.
+*.pcapng
+*.pcap
+reports/captures/*
+!reports/captures/.gitkeep

@@ -29,5 +29,15 @@ jobs:
             cd ~/project
             git pull origin week11          # 최신 코드 받기
             docker compose up --build -d     # 새 코드로 재빌드 + 교체
-            sleep 8
-            curl -f http://localhost:8000/health   # 200 아니면 배포 실패 처리
+            # /health가 뜰 때까지 최대 90초 재시도 (봇 기동에 시간이 걸림)
+            echo "waiting for /health ..."
+            for i in $(seq 1 30); do
+              if curl -fs http://localhost:8000/health; then
+                echo " -> healthy ✅"
+                exit 0
+              fi
+              sleep 3
+            done
+            echo "health check 실패 — 최근 로그:"
+            docker compose logs --tail=40
+            exit 1

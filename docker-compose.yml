@@ -1,0 +1,30 @@
+# 공주비서 실행 설정 (Phase 4)
+#
+# Dockerfile이 "이미지를 어떻게 굽나"라면, 이 파일은 "그 이미지를 어떤
+# 포트·볼륨·비밀값으로 켜나"를 정한다. 비밀값은 굽는 단계가 아니라 여기
+# (켜는 단계)에서 들어간다.
+#
+# 로컬(내 맥):   docker compose up --build   → build로 이미지를 굽고 켠다
+# EC2(Phase 6): image로 GHCR에서 pull해서 켠다 (그때 image: 줄 추가 예정)
+
+services:
+  secretary:
+    build: .                    # 현재 폴더 Dockerfile로 이미지 빌드
+    container_name: princess-secretary
+
+    # 비밀값을 런타임에 주입. .env는 이미지에 없고(.dockerignore), 여기서 읽어
+    # 컨테이너 환경변수로 넣는다. (DISCORD_BOT_TOKEN·ANTHROPIC_API_KEY·
+    #  NOTION_TOKEN·CLAUDE_MODEL, 선택 LANGSMITH_*)
+    env_file: .env
+
+    # 호스트 8000 → 컨테이너 8000. 이래야 맥 브라우저·폰에서 /health 접속 가능.
+    ports:
+      - "8000:8000"
+
+    # 대화기억 SQLite를 컨테이너 밖(호스트 ./data)에 둔다 → 컨테이너를 지워도
+    # 기억이 남는다. config.py의 MEMORY_DB_PATH = /app/data/memory.sqlite 와 매칭.
+    volumes:
+      - ./data:/app/data
+
+    # 봇이 죽거나 맥을 재부팅해도 (수동 down 전까진) 자동 재시작.
+    restart: unless-stopped

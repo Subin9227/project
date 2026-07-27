@@ -1,0 +1,33 @@
+# 이미지에 넣지 않을 것들.
+# 목적 2가지: (1) 비밀값·큰 파일이 이미지에 굽히는 걸 막고 (2) 이미지를 작게.
+
+# 비밀값 — 절대 이미지에 넣지 않는다 (런타임에 compose가 주입)
+.env
+.env.example
+
+# 로컬 파이썬 가상환경 (이미지 안에서 pip로 새로 깐다)
+.venv/
+
+# 대화기억 SQLite 등 런타임 데이터 (볼륨으로 밖에서 붙인다)
+data/
+
+# 파이썬 캐시
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 과제 산출물·캡처 (봇 실행과 무관, 용량만 큼)
+reports/
+scripts/
+*.pcapng
+*.pcap
+
+# 버전관리·에디터·OS 잡동사니
+.git/
+.gitignore
+.DS_Store
+
+# 문서 (실행에 불필요)
+CLAUDE.md
+PLAN.md
+progress.md

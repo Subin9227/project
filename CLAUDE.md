@@ -75,9 +75,23 @@ run.py → bot.py main() → agent.py build_agent()
     - ⚠️ `ps -E`·`/proc/environ` **금지** (환경변수=토큰 덤프됨. `reports/`는 gitignore 아님)
     - 곁가지 버그 수정: `trim_messages` 창이 도구 2회+ 호출 시 빈 목록 → `BadRequestError`
       (`agent.py`) — 자르는 단위를 '메시지 개수'→'대화 턴'으로. `RECENT_WINDOW` 3→2
-- ⏭️ 다음: **Phase 3** (`/health` + WireShark 2대 캡처). 그 후 #4 블레이버스 + 오프라인 알람
-    - `alarms.py` 신설 + `discord.ext.tasks`, 하루 4번 토글 DM
-      (07:25 켜 / 11:45 꺼 / 12:58 켜 / 17:48 꺼) + 링크, 밤엔 블라인드 잔소리
+- 2026-07-24  과제 트랙 **Phase 3 완료** (`/health` + WireShark) → `reports/wireshark.md`, `secretary/webserver.py`
+    - `webserver.py`: FastAPI `/health`, uvicorn을 bot.py의 `asyncio.gather`로 봇과 **한 프로세스**에서 실행 (0.0.0.0:8000)
+- 2026-07-27  과제 트랙 **Phase 4·5·6 완료** (Docker → EC2 → CI/CD)
+    - 산출물: `Dockerfile` · `.dockerignore` · `docker-compose.yml` · `.github/workflows/deploy.yml`
+    - Phase4 Docker: `python:3.11-slim` + Node20(노션 npx용) + `npm i -g @notionhq/notion-mcp-server`(런타임 다운로드 제거). `.env`는 **안 굽고** compose `env_file`로 주입, `data/`는 볼륨. 로컬 검증 OK
+    - Phase5 EC2: Ubuntu 26.04 t3.micro, `docker.io`+`docker-compose-v2`(공식repo 대신 우분투 패키지 — 최신 OS 대응), **swap 2GB**(RAM 1GB 빌드 OOM 예방), `git clone` + `scp .env`. 폰에서 외부 `/health` 확인 ✅
+    - Phase6 CI/CD: `deploy.yml`(appleboy/ssh-action) — **week11 push → SSH → `git pull`+재빌드+`/health`**. GitHub Secrets 3개(`EC2_HOST`/`EC2_USER`/`EC2_SSH_KEY`), 보안그룹 22 임시 개방(GitHub 접속용)
+    - ⚠️ 함정 3종(다음에 또 만남):
+      1) week11을 **main에서** 팠더니 Phase3(`/health`) 코드 누락 → 컨테이너에 `webserver.py` 없어 8000 안 열림. `git merge week10`로 해결. **교훈: 브랜치 베이스 = 의존 코드가 있는 곳**
+      2) `EC2_SSH_KEY`를 손으로 붙여넣어 줄바꿈 깨짐 → `ssh: no key found`. `cat pem | pbcopy`로 통째 복사
+      3) 배포 직후 `curl` 1회 → `Connection reset`(앱 미준비). 헬스체크를 **뜰 때까지 재시도** 루프로 (readiness 개념)
+    - 브랜치 상태: **week11 = week10(+Phase3) + Docker + CI/CD**. main은 아직 미병합(뒤처짐)
+    - EC2는 과금 우려로 **종료**(코드 전부 week11에 있어 재배포 가능), Elastic IP 반납
+- ⏭️ 다음: **vLLM 과제** — ① 개인프로젝트용 **공개 가중치 모델을 vLLM으로 서빙** ② (선택) 서빙엔진 Docker+EC2 배포
+    - ⚠️ vLLM은 **GPU 필요** → t3.micro 불가. 서빙 위치(로컬 맥 / GPU EC2 유료 / Colab) + 공개모델 선정부터 설계. PLAN §5 LoRA→GGUF 트랙과 연결
+- 🔜 미구현 기능(백로그): #4 블레이버스 + 오프라인 알람 — `alarms.py` + `discord.ext.tasks`, 하루 4번 토글 DM
+      (07:25 켜 / 11:45 꺼 / 12:58 켜 / 17:48 꺼) + 링크, 밤엔 블라인드 잔소리.
     - 하드코딩 페르소나 템플릿 (Claude 호출 없이). .env 필요: `DISCORD_USER_ID`(또는 채널ID) + `BLAVERSE_URL`
 - 🎓 과제 트랙 (2026-07-21 기획): 부트캠프 OS/네트워크·클라우드 과제를 봇에 얹음
     - 순서: 2 프로세스/메모리 → 3 `/health`+WireShark → 4 Docker → 5 EC2 → 6 CI/CD

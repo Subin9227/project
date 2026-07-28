@@ -10,6 +10,10 @@ langgraph-checkpoint-sqlite>=2.0   # SqliteSaver: 채널별 대화기억 저장�
 # Claude 모델 어댑터 (기존 anthropic 직접호출을 대체)
 langchain-anthropic>=0.3
 
+# OpenAI 호환 서버 어댑터 — 로컬 vLLM(Qwen)을 뇌로 바꿔 낄 때만 쓴다.
+# .env에 VLLM_BASE_URL이 없으면 import조차 안 된다. (agent.py _build_model)
+langchain-openai>=0.3
+
 # MCP 서버(노션 등)를 LangGraph 도구로 자동 변환
 langchain-mcp-adapters>=0.1
 

@@ -26,6 +26,14 @@ CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
 # 한 번의 답변에서 Claude가 생성할 최대 토큰 수. (기존 봇의 max_tokens=800 유지)
 MAX_TOKENS: int = int(os.getenv("MAX_TOKENS", "800"))
 
+# --- 로컬 모델 서빙 (vLLM) — 실험용 스위치 ---
+# VLLM_BASE_URL이 있을 때만 agent가 Claude 대신 이 서버를 쓴다.
+# .env에 안 넣으면 기존 Claude 경로 그대로 = 봇 동작 무변화.
+VLLM_BASE_URL: str | None = os.getenv("VLLM_BASE_URL") or None
+# vLLM 서버를 --api-key로 띄웠을 때 쓸 열쇠. 터널로 인터넷에 열리므로 반드시 건다.
+VLLM_API_KEY: str = os.getenv("VLLM_API_KEY", "not-needed")
+VLLM_MODEL: str = os.getenv("VLLM_MODEL", "Qwen/Qwen3.5-4B")
+
 # --- 경로 ---
 # 이 파일(secretary/config.py) 기준으로 프로젝트 루트를 계산한다.
 BASE_DIR: Path = Path(__file__).resolve().parent.parent

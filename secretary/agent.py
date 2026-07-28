@@ -20,7 +20,13 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.prebuilt import create_react_agent
 
-from secretary.config import CLAUDE_MODEL, MAX_TOKENS
+from secretary.config import (
+    CLAUDE_MODEL,
+    MAX_TOKENS,
+    VLLM_API_KEY,
+    VLLM_BASE_URL,
+    VLLM_MODEL,
+)
 from secretary.notion_tools import ROUTINE_TOOLS
 from secretary.persona import SYSTEM_PROMPT
 from secretary.tools import load_tools
@@ -76,6 +82,30 @@ def _prompt_with_today(state):
     return [SystemMessage(content=SYSTEM_PROMPT + today_line), *recent]
 
 
+def _build_model():
+    """뇌로 쓸 모델 어댑터를 고른다. 기본 Claude, VLLM_BASE_URL이 있으면 로컬 vLLM.
+
+    vLLM은 OpenAI 호환 서버라 base_url만 갈아끼우면 붙는다 — 그래서 아래 그래프
+    조립부는 한 줄도 바뀌지 않는다.
+    """
+    if not VLLM_BASE_URL:
+        return ChatAnthropic(model=CLAUDE_MODEL, max_tokens=MAX_TOKENS)
+
+    # 로컬 모델을 쓸 때만 필요한 의존성이라 여기서 늦게 import한다.
+    from langchain_openai import ChatOpenAI
+
+    return ChatOpenAI(
+        model=VLLM_MODEL,
+        base_url=VLLM_BASE_URL,
+        api_key=VLLM_API_KEY,
+        max_tokens=MAX_TOKENS,
+        temperature=0.7,
+        # Qwen3.5는 thinking이 기본 ON인데, 켜두면 짧은 질문에도 2048토큰·72초를
+        # 쓰고 답을 못 낸다(12주차 측정). 도구 호출 루프에선 치명적이라 끈다.
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+    )
+
+
 async def build_agent(checkpointer):
     """에이전트(컴파일된 LangGraph)를 만들어 돌려준다.
 
@@ -85,8 +115,8 @@ async def build_agent(checkpointer):
     Returns:
         agent: .ainvoke({"messages": [...]}, config)로 호출하는 실행 가능한 그래프.
     """
-    # 1) Claude 모델 어댑터. (기존 CLAUDE_MODEL, max_tokens=800을 그대로 계승)
-    model = ChatAnthropic(model=CLAUDE_MODEL, max_tokens=MAX_TOKENS)
+    # 1) 모델 어댑터. 기본은 Claude, .env에 VLLM_BASE_URL이 있으면 로컬 Qwen.
+    model = _build_model()
 
     # 2) 도구 장착 = MCP 도구(노션 읽기/검색 등) + 커스텀 도구(사진 인증 등)
     mcp_tools = await load_tools()      # tools.py 서랍: 노션 MCP 도구 24개

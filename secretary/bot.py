@@ -67,7 +67,15 @@ async def main() -> None:
 
         @client.event
         async def on_ready():
+            from secretary.config import CLAUDE_MODEL, VLLM_BASE_URL, VLLM_MODEL
+    
+            backend = (
+                f"로컬 vLLM — {VLLM_MODEL} @ {VLLM_BASE_URL}"
+                if VLLM_BASE_URL
+                else f"Claude API — {CLAUDE_MODEL}"
+            )
             print(f"공주비서 로그인 완료: {client.user}")
+            print(f"   뇌: {backend}")
 
         @client.event
         async def on_message(message: discord.Message):

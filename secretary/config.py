@@ -60,6 +60,18 @@ NOTION_VERSION: str = os.getenv("NOTION_VERSION", "2025-09-03")
 # 무료 플랜 파일 업로드 상한 (5MB). 이보다 크면 압축한다.
 NOTION_MAX_UPLOAD_BYTES: int = 5 * 1024 * 1024
 
+# --- 블레이버스 (비공식 API) ---
+# 공식 API가 없어서 웹앱이 쓰는 엔드포인트를 그대로 호출한다.
+# 인증은 refresh가 아니라 sign-in 직접 호출로 간다:
+#   토큰(JWT)이 1시간짜리라 손으로 갈아끼우는 게 불가능하고, 토큰 안에 발급 당시
+#   IP가 박히기 때문에 봇이 도는 서버에서 직접 로그인해야 IP도 맞는다.
+# 값이 없으면 블레이버스 도구를 아예 안 붙인다 (VLLM_BASE_URL과 같은 스위치 방식).
+BLAYBUS_API_BASE: str = "https://api-v2.blaybus.com"
+BLAYBUS_LOGIN_ID: str | None = os.getenv("BLAYBUS_LOGIN_ID") or None
+BLAYBUS_PASSWORD: str | None = os.getenv("BLAYBUS_PASSWORD") or None
+# 대부분의 경로가 /project/{id}/... 형태다. 사용자는 프로젝트가 하나뿐이라 상수로 둔다.
+BLAYBUS_PROJECT_ID: str = os.getenv("BLAYBUS_PROJECT_ID", "4983")
+
 # --- 상태 서버 (/health) — Phase 3 WireShark 캡처용 ---
 # 봇은 원래 바깥으로만 나가는 클라이언트라 접속받을 '문'이 없다.
 # 캡처할 서버 트래픽을 만들려고 /health 엔드포인트를 연다. (PLAN.md §9)

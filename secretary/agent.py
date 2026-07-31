@@ -21,6 +21,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.prebuilt import create_react_agent
 
 from secretary.config import (
+    BLAYBUS_LOGIN_ID,
+    BLAYBUS_PASSWORD,
     CLAUDE_MODEL,
     MAX_TOKENS,
     VLLM_API_KEY,
@@ -121,6 +123,11 @@ async def build_agent(checkpointer):
     # 2) 도구 장착 = MCP 도구(노션 읽기/검색 등) + 커스텀 도구(사진 인증 등)
     mcp_tools = await load_tools()      # tools.py 서랍: 노션 MCP 도구 24개
     tools = mcp_tools + ROUTINE_TOOLS   # notion_tools.py 서랍: attach_routine_photo 1개
+    if BLAYBUS_LOGIN_ID and BLAYBUS_PASSWORD:
+        # 계정 정보가 있을 때만 붙인다. 없으면 봇은 예전 그대로 (vLLM 스위치와 같은 방식).
+        from secretary.blaybus_tools import BLAYBUS_TOOLS
+
+        tools = tools + BLAYBUS_TOOLS
 
     # 3) 모델 + 도구 + 페르소나 + 기억을 묶어 에이전트를 만든다.
     #    prompt에 고정 문자열 대신 함수(_prompt_with_today)를 주어, 매 메시지마다

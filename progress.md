@@ -47,7 +47,8 @@
       <td>
         - Codex판 폐기·Slack→Discord 전환<br>
         - 봇 (message content intent) 연결<br>
-        - Anthropic SDK 단발 호출 + '아가씨' 페르소나. 도구·기억 없음
+        - Anthropic SDK 단발 호출 + '아가씨' 페르소나 프롬프트<br>
+        - 도구·기억 없음
       </td>
       <td>
         ⚠️ 현재, 원본 discord_claude_chat_app.py는 삭제됨.<br>
@@ -59,9 +60,10 @@
       <td>#2 노션 MCP</td>
       <td>단발 호출 → ReAct 에이전트</td>
       <td>
-        create_react_agent + SqliteSaver(채널별 기억) + npx @notionhq/notion-mcp-server(도구 24개)<br>
-        MCP에 파일 업로드가 없어 REST 직접 호출로 우회<br>
-        Pillow 5MB 압축
+        - create_react_agent + SqliteSaver(채널별 기억) + npx @notionhq/notion-mcp-server(도구 24개)<br>
+        - MCP에 파일 업로드가 없어 REST 직접 호출로 우회<br>
+        => 총 노션 MCP는 25개.<br>
+        - 노션 파일 업로드 : Pillow 5MB 압축
       </td>
       <td>
         agent.py:111-141(조립)<br>

@@ -10,6 +10,9 @@
 - 진입점: `.venv/bin/python run.py`
 - `.env` 필수 키 4개: `DISCORD_BOT_TOKEN`, `ANTHROPIC_API_KEY`, `CLAUDE_MODEL`, `NOTION_TOKEN`
   (선택: `LANGSMITH_TRACING`·`LANGSMITH_API_KEY`·`LANGSMITH_ENDPOINT`·`LANGSMITH_PROJECT` — 관측용, #3 추가)
+  (선택: `BLAYBUS_LOGIN_ID`·`BLAYBUS_PASSWORD` — **있을 때만** 블레이버스 도구 3개 장착.
+   `BLAYBUS_PROJECT_ID` 기본 4983. ⚠️ 비밀번호에 `#`이 있으면 작은따옴표로 감쌀 것)
+  (선택: `VLLM_BASE_URL`·`VLLM_API_KEY`·`VLLM_MODEL` — 있으면 Claude 대신 로컬 모델, #12 실험)
 - `.env` / `.venv/` / `data/` 는 gitignore (커밋 금지)
 
 ## 구조 (secretary/ 패키지)
@@ -20,6 +23,8 @@
 | `persona.py` | '아가씨' 집사 시스템 프롬프트 |
 | `tools.py` | 노션 MCP 도구 로드 (`MultiServerMCPClient` → 도구 24개) |
 | `notion_tools.py` | MCP가 못 하는 파일 업로드/이미지 블록을 노션 REST 직접 호출(httpx) |
+| `blaybus_tools.py` | 블레이버스 **비공식 API** 직접 호출(httpx). 도구 3개(status/start/stop) |
+| `webserver.py` | FastAPI `/health`. bot.py의 `asyncio.gather`로 봇과 **한 프로세스**(Phase 3) |
 | `agent.py` | `create_react_agent` (모델 + MCP도구 + 커스텀도구 + SqliteSaver 기억) |
 | `bot.py` | 디스코드 게이트웨이. on_message → agent.ainvoke → 답장 |
 | `run.py` (루트) | `asyncio.run(main())` 진입점 |
@@ -30,8 +35,10 @@
 run.py → bot.py main() → agent.py build_agent()
    ├─ AsyncSqliteSaver(data/memory.sqlite) 열기  (thread_id = 디스코드 채널ID)
    ├─ tools.py load_tools() → npx 노션 MCP 서버 → 도구 24개
-   └─ notion_tools.ROUTINE_TOOLS(사진인증) 합쳐서 create_react_agent
+   ├─ notion_tools.ROUTINE_TOOLS(사진인증 1개)
+   └─ BLAYBUS_LOGIN_ID 있으면 blaybus_tools.BLAYBUS_TOOLS(3개) → 총 28개
 메시지 오면: Claude가 도구를 이름으로 골라 호출 → 결과 → 페르소나 답장
+(webserver.py의 uvicorn은 bot.py에서 asyncio.gather로 같은 프로세스에 함께 실행)
 ```
 
 ## 노션 연결 (중요)
@@ -46,12 +53,34 @@ run.py → bot.py main() → agent.py build_agent()
   (하루 1행, 체크박스 6개=코테/도착8시/운동/영어스피킹/어드민나잇/회고, 달성률 수식).
   ⚠️ 헤딩 "어드민 나잇"(공백) ≠ 체크박스 "어드민나잇"(붙임).
 
+## 블레이버스 연결 (중요 — 비공식 API)
+
+- 공식 API·문서 없음. 웹앱이 쓰는 내부 API를 개발자도구로 확보해 그대로 호출한다.
+  base: `https://api-v2.blaybus.com` (웹사이트 `www.blaybus.com`과 **다른 호스트**)
+- 인증은 `POST /auth/user/sign-in`에 `{"loginId","password"}` → 쿠키 3종이 `Set-Cookie`로.
+  httpx `AsyncClient`가 쿠키함을 자동 관리하므로 이후 요청엔 알아서 실린다.
+- ⚠️ **쿠키만 보내면 401.** `cs_token` 쿠키 값을 `x-csrf-token` **헤더에도** 실어야 통과
+  (double-submit). `cs_token`만 HttpOnly가 없는 이유가 이것 — JS가 읽어 헤더에 넣으라고.
+- ⚠️ **쿠키 수명(3일) ≠ 안에 든 JWT 수명(1시간).** 쿠키가 있어도 죽은 토큰일 수 있으므로
+  만료를 미리 계산하지 말고 **401을 받고 나서 재로그인**한다. 재시도는 **1회 고정**
+  (비번 오류·계정 잠금도 401이라 무한 재시도하면 스스로 계정을 잠근다).
+- refresh 대신 sign-in을 고른 이유: `refresh_token`도 3일이라 결국 손이 가고,
+  토큰에 발급 IP가 박혀 있어 EC2에선 **그 서버에서 직접 로그인**해야 맞다.
+- 엔드포인트 (`{pid}` = `BLAYBUS_PROJECT_ID`)
+  | 용도 | 요청 |
+  |---|---|
+  | 진행 중인 세션 | `GET /task-session/active` (taskId·제목·경과초 포함 → stop이 인자 불필요) |
+  | 태스크 목록 | `GET /project/{pid}/task` (이름→ID 변환용) |
+  | 시작 / 중지 | `POST /task/{taskId}/session/start` · `/stop` (바디 없음) |
+- 검증 도구: `scripts/blaybus_probe.py` — 읽기 전용. `python -m scripts.blaybus_probe '<경로>'`
+
 ## 핵심 설계 결정
 
 - 봇 1개(구현) + 내부는 LangGraph **단일 `create_react_agent`**. 웹훅 페르소나 4요원은 **목표(미구현, PLAN §1)** — 팔다리 늘면 리팩터링
 - 웹 대화(`/chat`)·멀티유저는 **안 함/보류** (보안·권한 복잡, PLAN §9). Streamlit은 읽기 전용 조망만
 - 노션: 개인 워크스페이스에 채우고 org(게스트)엔 사용자가 수동 복붙
-- 블레이버스: API 없음 → 자동화 안 함. cron 알림 + 링크만 보내고 클릭은 사용자
+- 블레이버스: **공식 API는 없지만 웹앱 내부 API가 있음** → 개발자도구로 요청을 복제해 자동화.
+  봇이 직접 시작/종료 (2026-07-31, 아래 '블레이버스 연결' 참고). ⚠️ 비공식이라 예고 없이 깨질 수 있음
 - 도구 전략: 있는 건 MCP, 빠진 건 REST 직접
 - 부트캠프 과제 접목: LoRA→PTQ→GGUF 모델을 봇 1차 라우터로 / OS·네트워크·클라우드 과제는 봇에 얹음 (상세 `PLAN.md` §9)
 
@@ -86,7 +115,8 @@ run.py → bot.py main() → agent.py build_agent()
       1) week11을 **main에서** 팠더니 Phase3(`/health`) 코드 누락 → 컨테이너에 `webserver.py` 없어 8000 안 열림. `git merge week10`로 해결. **교훈: 브랜치 베이스 = 의존 코드가 있는 곳**
       2) `EC2_SSH_KEY`를 손으로 붙여넣어 줄바꿈 깨짐 → `ssh: no key found`. `cat pem | pbcopy`로 통째 복사
       3) 배포 직후 `curl` 1회 → `Connection reset`(앱 미준비). 헬스체크를 **뜰 때까지 재시도** 루프로 (readiness 개념)
-    - 브랜치 상태: **week11 = week10(+Phase3) + Docker + CI/CD**. main은 아직 미병합(뒤처짐)
+    - 브랜치 상태: **week11 = week10(+Phase3) + Docker + CI/CD**
+      (2026-07-31 기준 week10·11·12·local-router는 **전부 main에 병합됨** — 브랜치는 과거 이정표일 뿐)
     - EC2는 과금 우려로 **종료**(코드 전부 week11에 있어 재배포 가능), Elastic IP 반납
 - 2026-07-28  **12주차 vLLM 과제 필수① 완료** → `notebooks/vllm_qwen35.ipynb` (브랜치 `week12`)
     - 결정: 서빙 위치 **Colab Pro L4(24GB)** / 모델 **`Qwen/Qwen3.5-4B`** (2026-02 릴리스, 소형 0.8B·2B·4B·9B 중)
@@ -114,9 +144,37 @@ run.py → bot.py main() → agent.py build_agent()
       8192는 라우터(짧은 분류)용으로 정한 값인데 봇은 **노션 도구 24개 스키마**를 매 요청에 싣는다.
       확보 캐시가 236,274토큰이라 **32768로 올려도 동시성 7x** → 다음 실험 때 검증할 것
     - ⏭️ 미해결: CLI엔 디스코드 같은 이미지 URL 자동첨부가 없어 사진 인증 경로는 테스트 못 함 (실험환경 한계, 모델 문제 아님)
-- 🔜 미구현 기능(백로그): #4 블레이버스 + 오프라인 알람 — `alarms.py` + `discord.ext.tasks`, 하루 4번 토글 DM
-      (07:25 켜 / 11:45 꺼 / 12:58 켜 / 17:48 꺼) + 링크, 밤엔 블라인드 잔소리.
-    - 하드코딩 페르소나 템플릿 (Claude 호출 없이). .env 필요: `DISCORD_USER_ID`(또는 채널ID) + `BLAVERSE_URL`
+- 2026-07-31  **블레이버스 API 연결** (브랜치 `main`) → `secretary/blaybus_tools.py` · `scripts/blaybus_probe.py`
+    - "API 없어서 자동화 못 함"이라던 판단을 뒤집음: **공개 API가 없을 뿐 웹앱 내부 API는 있었다.**
+      개발자도구로 요청을 복제 → 디스코드 대화만으로 시작/중지 가능 (스펙은 위 '블레이버스 연결' 절)
+    - 도구 3개: `blaybus_status` / `blaybus_start(task_title)` / `blaybus_stop`
+      · 이름→ID 해석은 **완전일치 우선**. 안 그러면 "오후"가 `오후 (1/2)`·`(2/2)`까지 걸려 매번 되묻는다
+      · `stop`은 인자 없음 — `/task-session/active` 응답에 taskId가 들어있어 스스로 찾는다
+    - 순서가 핵심이었음: **① 인증 뚫리나(90줄 프로브) → ② 주소 파악 → ③ 도구 구현.**
+      ②③을 먼저 했으면 ①에서 막혔을 때 전부 버렸을 것
+    - `agent.py`는 조건부 4줄만 추가. 그래프 조립부 무변화 — vLLM 스위치와 같은 방식
+    - **새 의존성 0개** (httpx는 노션 업로드용으로 이미 있었음)
+    - ⚠️ 함정 (다음에 또 만남):
+      1) 개발자도구 Name 열은 **경로의 마지막 조각만** 표시 (`start` ← 실제 `/task/{id}/session/start`).
+         전체 주소는 우클릭 → **Copy URL**. 지도를 통째로 뜨려면 **Copy all listed URLs**
+      2) `Copy all listed URLs`는 **주소만 주고 메서드·바디는 안 준다.** 생성·수정용 cURL은 따로 떠야 함.
+         그리고 **버튼을 눌러야 찍힌다** — 가만히 두면 `presence/ping` 폴링만 쌓임
+      3) **404는 인증 실패가 아니라 주소 오류.** 401/403(=너 누구냐)과 반드시 구분할 것.
+         프로브가 이걸 뭉뚱그려 "실패"로 찍어서 엉뚱한 데(헤더 추가)를 팔 뻔했다
+      4) 실험 스크립트는 **성공 케이스를 먼저** 돌린다. `x-csrf-token` 없이 한 번 보내면
+         서버가 그 세션을 끊어서, 실패를 먼저 하면 뒤의 성공 케이스까지 401이 된다
+      5) `.env` 값은 **작은따옴표**로 감쌀 것. `PW=abc #def`는 공백 뒤 `#`부터 주석,
+         큰따옴표는 `\t`를 탭으로 해석해 **조용히 다른 값**이 된다 (에러도 안 남)
+      6) `len()`은 타입을 안 가린다 — 셀프테스트가 `len(dict)`(키 개수 2)를 세서 **틀린 이유로 통과**했다.
+         `isinstance`까지 단언할 것
+    - ⏭️ 미구현: 아젠다/태스크 **생성·수정·삭제** — POST 바디를 모른다(생성 버튼을 안 눌러 cURL 미확보).
+      다음 세션에서 cURL 수집 후 추가 예정. ⚠️ 삭제 도구는 **테스트용 아젠다에서만** 검증할 것
+    - 블로그: #8-1(API 찾기·인증 뜯어보기) / #8-2(설계 결정·구현)
+- 🔜 미구현 기능(백로그): 오프라인 알람 — `alarms.py` + `discord.ext.tasks`, 하루 4번 토글 DM
+      (07:25 켜 / 11:45 꺼 / 12:58 켜 / 17:48 꺼), 밤엔 블라인드 잔소리.
+    - **블레이버스 API가 붙었으므로 "링크 보내고 클릭은 사용자"가 아니라 봇이 직접 토글 가능.**
+      알림은 확인·잔소리용으로 격하
+    - 하드코딩 페르소나 템플릿 (Claude 호출 없이). .env 필요: `DISCORD_USER_ID`(또는 채널ID)
 - 🎓 과제 트랙 (2026-07-21 기획): 부트캠프 OS/네트워크·클라우드 과제를 봇에 얹음
     - 순서: 2 프로세스/메모리 → 3 `/health`+WireShark → 4 Docker → 5 EC2 → 6 CI/CD
       (Phase 1 서술형5문제는 스킵. LoRA→GGUF(백로그 ⑦)는 별도 Qwen 모델 필요 → 클라우드 트랙 뒤로 미룸)
@@ -136,6 +194,11 @@ run.py → bot.py main() → agent.py build_agent()
 - 디스코드 답변 2000자 제한 (bot.py에서 자름)
 - `.env`·`config.py`를 바꾸면 봇을 껐다 켜야 반영됨. 재시작 시 낡은 프로세스까지 죽일 것(`pkill -f run.py`) — 안 그러면 옛 설정으로 계속 돎 (#3에서 크게 헤맴)
 - 반드시 `~/project`에서 `claude` 실행 (다른 곳에서 켜면 이 CLAUDE.md가 자동 로드 안 됨)
+- 블레이버스는 **비공식 API**라 예고 없이 스펙이 바뀔 수 있음. 깨지면 개발자도구로 다시 확보
+- 프로젝트 루트 밖 스크립트(`/tmp/*.py` 등)에서 `secretary`를 import하려면 `PYTHONPATH=.` 필요.
+  `scripts/`의 것은 `python -m scripts.<이름>`으로 돌리면 불필요
+- 브랜치를 **미리 파두면 낡는다.** 그 사이 main이 앞서가면 `git switch` 시 "덮어쓴다"며 거부됨
+  → 작업 직전에 파거나, 낡았으면 `git branch -D` 후 다시 생성 (**교훈: 브랜치는 작업 직전에**)
 
 <!--
 ========================================================================

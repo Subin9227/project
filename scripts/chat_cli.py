@@ -24,7 +24,12 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.errors import GraphRecursionError
 
 from secretary.agent import build_agent
-from secretary.bot import AGENT_TIMEOUT_SEC, RECURSION_LIMIT, _extract_text
+from secretary.bot import (
+    AGENT_TIMEOUT_SEC,
+    RECURSION_LIMIT,
+    _extract_text,
+    _today_kst,
+)
 from secretary.config import (
     CLAUDE_MODEL,
     MEMORY_DB_PATH,
@@ -32,9 +37,11 @@ from secretary.config import (
     VLLM_MODEL,
 )
 
-# 디스코드 채널 ID 대신 쓰는 고정 대화방 이름.
+# 디스코드 채널 ID 대신 쓰는 대화방 이름.
 # 실제 채널 ID와 겹치지 않으므로 실험 대화가 봇의 기억을 오염시키지 않는다.
-THREAD_ID = "cli-experiment"
+# 봇과 같은 '이름:날짜' 규칙을 따른다 — 안 그러면 bot.py의 정리에 걸려
+# 봇을 켤 때마다 CLI 대화기억이 통째로 날아간다.
+THREAD_ID = f"cli-experiment:{_today_kst()}"
 
 
 def _print_trace(new_messages: list) -> None:

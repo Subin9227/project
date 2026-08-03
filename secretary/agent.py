@@ -14,7 +14,6 @@ create_react_agent가 내부적으로 대신 해주는 것:
 from __future__ import annotations
 
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -24,6 +23,7 @@ from secretary.config import (
     BLAYBUS_LOGIN_ID,
     BLAYBUS_PASSWORD,
     CLAUDE_MODEL,
+    KST,
     MAX_TOKENS,
     VLLM_API_KEY,
     VLLM_BASE_URL,
@@ -33,8 +33,6 @@ from secretary.notion_tools import ROUTINE_TOOLS
 from secretary.persona import SYSTEM_PROMPT
 from secretary.tools import load_tools
 
-# 봇이 어느 서버에서 돌든 날짜 기준은 한국 시간으로 고정한다.
-KST = ZoneInfo("Asia/Seoul")
 _WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
 
 # 모델에 실어 보낼 최근 '대화 턴' 수. (메시지 개수가 아니다 — #4-2에서 바뀐 단위)

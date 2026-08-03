@@ -5,14 +5,17 @@
 agent.py가 만든 에이전트에게 넘긴다.
 
 대화기억의 핵심:
-    thread_id = 디스코드 채널 ID.
-    같은 채널에서 온 메시지는 같은 thread_id를 쓰므로, 에이전트가
-    이전 대화를 이어서 기억한다. (채널이 다르면 기억도 분리된다.)
+    thread_id = "디스코드 채널 ID:KST 오늘 날짜".
+    같은 채널이라도 날짜가 바뀌면 다른 thread_id가 되므로, 대화는 하루 단위로
+    새로 시작한다. 공주비서가 하는 일(오늘 루틴 확인·체크, 블레이버스 토글)은
+    전부 '오늘'로 끝나서, 어제 맥락을 끌고 오면 득보다 실이 크다.
+    ("어제 뭐 했더라"는 대화기억이 아니라 노션을 조회해서 답할 일이다.)
 """
 
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta
 
 import discord
 from langchain_core.messages import HumanMessage
@@ -20,7 +23,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.errors import GraphRecursionError
 
 from secretary.agent import build_agent
-from secretary.config import DISCORD_BOT_TOKEN, MEMORY_DB_PATH
+from secretary.config import DISCORD_BOT_TOKEN, KST, MEMORY_DB_PATH
 from secretary.webserver import build_health_server
 
 # 디스코드 한 메시지의 최대 길이. 초과분은 잘라서 보낸다.
@@ -32,6 +35,50 @@ DISCORD_MAX_LEN = 2000
 RECURSION_LIMIT = 12
 # 겹2: 한 메시지 처리의 벽시계 상한(초). 넘으면 중단하고 사과 답장.
 AGENT_TIMEOUT_SEC = 90
+
+# 대화기억을 며칠치 남길지. 오늘 포함이므로 7 = 오늘~6일 전.
+KEEP_DAYS = 7
+
+
+def _today_kst() -> str:
+    return f"{datetime.now(KST):%Y-%m-%d}"
+
+
+async def _prune_old_threads(checkpointer: AsyncSqliteSaver) -> int:
+    """낡은 날짜의 대화기억을 지운다. 봇을 켤 때 딱 한 번.
+
+    thread_id가 '<채널ID>:<YYYY-MM-DD>' 형태라 끝 10자로 날짜를 판별한다.
+    날짜가 안 붙은 옛 thread_id(이 규칙 이전에 쌓인 것)도 같은 조건에 걸려
+    자동으로 지워진다 — 따로 마이그레이션할 필요가 없다.
+
+    ⚠️ DELETE만으로는 파일 크기가 안 줄어든다(빈 페이지로 남는다). VACUUM까지 해야
+       디스크로 반납된다. 그리고 VACUUM은 트랜잭션 안에서 못 도니 commit이 먼저다.
+    ⚠️ 이 DB는 WAL 모드다. VACUUM 결과가 -wal에만 쌓여서, 연결이 살아있는 동안에는
+       본 파일이 77MB 그대로로 보인다(껐다 켜면 그때 줄어든다). wal_checkpoint를
+       TRUNCATE로 한 번 돌려야 그 자리에서 반납된다.
+
+    ponytail: 시작할 때 1회. 프로세스가 몇 달씩 안 죽으면 그때 main()의
+    asyncio.gather에 하루 한 번 도는 태스크로 올린다.
+    """
+    today = datetime.now(KST).date()
+    keep = {(today - timedelta(days=d)).isoformat() for d in range(KEEP_DAYS)}
+
+    # thread_id 목록만 필요하다. alist()로 훑으면 체크포인트를 전부 역직렬화하므로
+    # (수십 MB) 목록은 SQL로 싸게 얻고, 삭제는 공개 API에 맡긴다.
+    async with checkpointer.conn.execute(
+        "SELECT DISTINCT thread_id FROM checkpoints"
+    ) as cur:
+        thread_ids = [row[0] for row in await cur.fetchall()]
+
+    stale = [t for t in thread_ids if t[-10:] not in keep]
+    for thread_id in stale:
+        await checkpointer.adelete_thread(thread_id)
+
+    if stale:
+        await checkpointer.conn.commit()
+        await checkpointer.conn.execute("VACUUM")
+        await checkpointer.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    return len(stale)
 
 
 def _extract_text(message) -> str:
@@ -63,6 +110,11 @@ async def main() -> None:
     # 대화기억 저장소를 열고, 그 안에서 봇 생애 전체를 돈다.
     # (async with 블록이 유지되는 동안 SQLite 연결이 살아있다.)
     async with AsyncSqliteSaver.from_conn_string(str(MEMORY_DB_PATH)) as checkpointer:
+        pruned = await _prune_old_threads(checkpointer)
+        if pruned:
+            size_mb = MEMORY_DB_PATH.stat().st_size / 1024 / 1024
+            print(f"낡은 대화기억 {pruned}개 정리 완료 (현재 {size_mb:.1f}MB)")
+
         agent = await build_agent(checkpointer)
 
         @client.event
@@ -99,10 +151,14 @@ async def main() -> None:
             if not user_text:
                 return
 
-            # 채널 ID를 thread_id로 사용 → 채널별 대화 맥락 유지
+            # thread_id = 채널ID + KST 오늘 날짜 → 날짜가 바뀌면 대화가 새로 시작된다.
+            # 자정을 넘기면 맥락이 끊기지만 그게 맞다: _prompt_with_today가 이미 매번
+            # 오늘 날짜를 새로 주입하므로, 안 끊으면 어제 맥락에 오늘 날짜가 섞인다.
             # recursion_limit(겹1)로 스텝 상한을 걸어 무한 재시도를 막는다.
             config = {
-                "configurable": {"thread_id": str(message.channel.id)},
+                "configurable": {
+                    "thread_id": f"{message.channel.id}:{_today_kst()}"
+                },
                 "recursion_limit": RECURSION_LIMIT,
             }
 

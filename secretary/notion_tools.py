@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import io
 import os
-from datetime import date as date_cls
+from datetime import datetime
 from urllib.parse import urlparse
 
 import httpx
@@ -30,6 +30,7 @@ from langchain_core.tools import tool
 from PIL import Image
 
 from secretary.config import (
+    KST,
     NOTION_API_BASE,
     NOTION_MAX_UPLOAD_BYTES,
     NOTION_ROUTINE_DS_ID,
@@ -265,7 +266,9 @@ async def attach_routine_photo(
         valid = " / ".join(ITEMS.keys())
         return f"'{item}'은(는) 모르는 항목이에요. 가능한 항목: {valid}"
 
-    day = date_cls.today().isoformat() if date in ("", "today", None) else date
+    # ⚠️ date.today()를 쓰면 시스템 로컬 날짜라 UTC 컨테이너에서 KST 0~9시에
+    #    어제 행에 기록된다. '오늘'은 언제나 KST 기준이어야 한다.
+    day = datetime.now(KST).strftime("%Y-%m-%d") if date in ("", "today", None) else date
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:

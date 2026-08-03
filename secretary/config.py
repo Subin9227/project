@@ -9,8 +9,14 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
+
+# 봇이 어느 서버에서 돌든 '오늘'의 기준은 한국 시간으로 고정한다.
+# (EC2 컨테이너는 UTC라 이걸 안 쓰면 KST 0~9시에 어제 날짜로 기록된다.)
+# agent·bot·notion_tools 셋이 다 쓰므로 config에 둔다 — agent에 두면 순환 import.
+KST = ZoneInfo("Asia/Seoul")
 
 # .env 파일을 읽어서 환경변수로 올린다. (프로젝트 루트의 .env)
 load_dotenv()

@@ -14,10 +14,8 @@ langchain-anthropic>=0.3
 # .env에 VLLM_BASE_URL이 없으면 import조차 안 된다. (agent.py _build_model)
 langchain-openai>=0.3
 
-# MCP 서버(노션 등)를 LangGraph 도구로 자동 변환
-langchain-mcp-adapters>=0.1
-
-# 노션 File Upload API 직접 호출 + 이미지 압축
+# 노션 REST 직접 호출 + 이미지 압축
+# (노션 MCP 서버는 #9 Phase 1에서 걷어냈다 — langchain-mcp-adapters도 같이 빠짐)
 httpx>=0.27
 Pillow>=10.0
 

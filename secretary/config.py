@@ -58,8 +58,14 @@ NOTION_ROUTINE_DS_ID: str = os.getenv(
     "NOTION_ROUTINE_DS_ID", "a5a0ffe9-306d-82c0-b5df-07a9145e578b"
 )
 
+# "과제 제출 (2)" 데이터소스 ID. 루틴 DB와 같은 페이지에 들어있는 별개 DB.
+# 주차별 1행. 내용(과제 결과·회고)은 사람이 쓰고, 봇은 틀을 깔고 상태만 옮긴다.
+NOTION_HOMEWORK_DS_ID: str = os.getenv(
+    "NOTION_HOMEWORK_DS_ID", "f8a0ffe9-306d-8267-8473-8765b724ec67"
+)
+
 # 노션 REST API를 직접 호출할 때 쓰는 상수.
-# (MCP 서버엔 파일 업로드/이미지 블록 도구가 없어서 직접 호출한다.)
+# (MCP 서버를 걷어내고 필요한 것만 직접 부른다 — #9 Phase 1)
 NOTION_API_BASE: str = "https://api.notion.com/v1"
 NOTION_VERSION: str = os.getenv("NOTION_VERSION", "2025-09-03")
 

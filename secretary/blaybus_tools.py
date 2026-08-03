@@ -476,6 +476,74 @@ async def blaybus_rename(old_title: str, new_title: str, kind: str | None = None
     return f"{_KIND_KR[found_kind]} '{item['title']}'를 '{new_title}'로 바꿨어요."
 
 
+def _group_by_parent(items: list[dict]) -> dict[tuple[str, str], list[tuple[str, int]]]:
+    """(아젠다, 워크) → [(태스크, 분), ...] 로 묶는다."""
+    out: dict[tuple[str, str], list[tuple[str, int]]] = {}
+    for t in items:
+        key = (
+            (t.get("agenda") or {}).get("title") or "(아젠다 없음)",
+            (t.get("work") or {}).get("title") or "(워크 없음)",
+        )
+        out.setdefault(key, []).append((t["title"], int(t.get("duration") or 0)))
+    return out
+
+
+@tool
+async def blaybus_today_tasks(date: str = "today") -> str:
+    """그날 블레이버스에서 시간을 잰 태스크를 아젠다 > 워크 > 태스크 > 시간으로 뽑는다.
+
+    데일리루틴 '오늘 한 일' 칸을 채울 때 이걸로 먼저 뽑아서 그대로 옮겨 적으면 된다.
+    "오늘 뭐 했지?", "오늘 몇 시간 일했어?" 같은 물음에도 쓴다.
+
+    Args:
+        date: 대상 날짜 YYYY-MM-DD. 기본 'today' = 오늘.
+
+    Returns:
+        아젠다 > 워크별로 묶은 태스크와 시간, 그리고 합계.
+    """
+    today = datetime.now(KST).strftime("%Y-%m-%d")
+    day = today if date in ("", "today", None) else date
+    try:
+        uid = await _my_id()
+        resp = await _request(
+            "GET", f"/task/calendar/user?from={day}&to={day}&userId={uid}"
+        )
+        resp.raise_for_status()
+        # ⚠️ source로 반드시 거른다. 'upcoming'(미완료)은 duration이 없는 채로
+        #    조회 날짜와 무관하게 딸려 나온다 — 안 거르면 남의 날 일이 섞인다.
+        done = [t for t in resp.json()["data"]["list"] if t.get("source") == "completed"]
+
+        # 지금 돌고 있는 태스크는 아직 completed가 아니라 따로 붙여준다.
+        # ⚠️ 오늘을 물었을 때만. 과거 날짜에 붙이면 그날 안 한 일이 섞이고
+        #    합계까지 틀어진다.
+        running = []
+        if day == today:
+            active = await _request("GET", "/task-session/active")
+            active.raise_for_status()
+            running = active.json()["data"]["list"]
+    except Exception as e:  # noqa: BLE001
+        return f"블레이버스 조회 중 오류: {type(e).__name__}: {e}"
+
+    if not done and not running:
+        return f"{day}에 블레이버스로 시간을 잰 태스크가 없어요."
+
+    lines: list[str] = []
+    total = 0
+    for (agenda, work), tasks in _group_by_parent(done).items():
+        lines.append(f"{agenda} > {work}")
+        for title, minutes in tasks:
+            total += minutes
+            lines.append(f"  · {title}  {_duration(minutes * 60)}")
+
+    for s in running:
+        secs = int(s.get("elapsedSeconds") or 0)
+        total += secs // 60
+        lines.append(f"  · {s['taskTitle']}  {_duration(secs)} (진행 중)")
+
+    lines.append(f"합계 {_duration(total * 60)}")
+    return "\n".join(lines)
+
+
 # agent.py가 가져다 쓰는 도구 목록
 BLAYBUS_TOOLS = [
     blaybus_status,
@@ -486,6 +554,7 @@ BLAYBUS_TOOLS = [
     blaybus_add_work,
     blaybus_add_task,
     blaybus_rename,
+    blaybus_today_tasks,
 ]
 
 

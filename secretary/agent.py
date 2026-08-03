@@ -29,9 +29,9 @@ from secretary.config import (
     VLLM_BASE_URL,
     VLLM_MODEL,
 )
+from secretary.homework_tools import HOMEWORK_TOOLS
 from secretary.notion_tools import ROUTINE_TOOLS
 from secretary.persona import SYSTEM_PROMPT
-from secretary.tools import load_tools
 
 _WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
 
@@ -118,9 +118,11 @@ async def build_agent(checkpointer):
     # 1) 모델 어댑터. 기본은 Claude, .env에 VLLM_BASE_URL이 있으면 로컬 Qwen.
     model = _build_model()
 
-    # 2) 도구 장착 = MCP 도구(노션 읽기/검색 등) + 커스텀 도구(사진 인증 등)
-    mcp_tools = await load_tools()      # tools.py 서랍: 노션 MCP 도구 24개
-    tools = mcp_tools + ROUTINE_TOOLS   # notion_tools.py 서랍: attach_routine_photo 1개
+    # 2) 도구 장착. 전부 노션 REST를 직접 부르는 전용 도구다.
+    #    노션 MCP 서버(범용 도구 24개)는 #9 Phase 1에서 걷어냈다:
+    #      · 매 요청에 스키마 24개가 실려 비쌌고, 작은 모델은 그중에서 잘 못 골랐다
+    #      · MCP는 토큰이 subprocess 실행 시점에 고정되어 사용자별 노션이 불가능하다
+    tools = ROUTINE_TOOLS + HOMEWORK_TOOLS
     if BLAYBUS_LOGIN_ID and BLAYBUS_PASSWORD:
         # 계정 정보가 있을 때만 붙인다. 없으면 봇은 예전 그대로 (vLLM 스위치와 같은 방식).
         from secretary.blaybus_tools import BLAYBUS_TOOLS
@@ -130,6 +132,8 @@ async def build_agent(checkpointer):
     # 3) 모델 + 도구 + 페르소나 + 기억을 묶어 에이전트를 만든다.
     #    prompt에 고정 문자열 대신 함수(_prompt_with_today)를 주어, 매 메시지마다
     #    '아가씨 말투 + 오늘 날짜'가 담긴 시스템 메시지를 새로 생성해 주입한다.
+    print(f"   도구: {len(tools)}개 — " + ", ".join(t.name for t in tools))
+
     agent = create_react_agent(
         model,
         tools,

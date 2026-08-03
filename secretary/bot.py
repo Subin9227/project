@@ -23,6 +23,12 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.errors import GraphRecursionError
 
 from secretary.agent import build_agent
+from secretary.alarms import (
+    _WEEKDAY_KR,
+    build_alarm_loop,
+    load_schedules,
+    resolve_target,
+)
 from secretary.config import DISCORD_BOT_TOKEN, KST, MEMORY_DB_PATH
 from secretary.webserver import build_health_server
 
@@ -101,6 +107,30 @@ def _extract_text(message) -> str:
     return text[:DISCORD_MAX_LEN]
 
 
+async def _describe_target(client: discord.Client, schedule) -> str:
+    """알림이 실제로 어디로 갈지 사람이 읽을 수 있게.
+
+    기동할 때 확인시켜 주는 게 핵심이다: 채널 ID를 잘못 넣으면 알림 시각이
+    되어서야 실패를 알게 되는데, 그땐 이미 한 번 놓친 뒤다.
+    """
+    try:
+        dest, kind = await resolve_target(client, schedule.target)
+    except Exception as e:  # noqa: BLE001
+        return (
+            f"⚠️ {schedule.target}를 채널로도 사람으로도 못 찾았어요 "
+            f"({type(e).__name__}) — 이대로면 알림이 안 갑니다"
+        )
+
+    if kind == "user":
+        return f"DM → {dest}"
+
+    name = getattr(dest, "name", None) or str(dest)
+    guild = getattr(dest, "guild", None)
+    where = f"{guild.name} / #{name}" if guild else f"#{name}"
+    mention = " (멘션 켬)" if schedule.mention_id else " (멘션 없음)"
+    return f"{where}{mention}"
+
+
 async def main() -> None:
     """봇을 기동한다. run.py가 이 함수를 asyncio.run으로 실행한다."""
     intents = discord.Intents.default()
@@ -116,6 +146,7 @@ async def main() -> None:
             print(f"낡은 대화기억 {pruned}개 정리 완료 (현재 {size_mb:.1f}MB)")
 
         agent = await build_agent(checkpointer)
+        alarm_loop = build_alarm_loop(client)
 
         @client.event
         async def on_ready():
@@ -128,6 +159,20 @@ async def main() -> None:
             )
             print(f"공주비서 로그인 완료: {client.user}")
             print(f"   뇌: {backend}")
+
+            # 알림은 로그인 뒤에 켠다 (DM을 보내려면 게이트웨이가 붙어 있어야 한다).
+            # on_ready는 재접속 때도 불리므로 이미 돌고 있으면 다시 켜지 않는다.
+            schedules = load_schedules()
+            if not schedules:
+                print("   알림: 꺼짐 (.env에 ALARM_TARGET 없음)")
+            elif not alarm_loop.is_running():
+                alarm_loop.start()
+                s = schedules[0]
+                print(f"   알림 대상: {await _describe_target(client, s)}")
+                print(
+                    f"   알림 시각: 업무 {s.work_start:%H:%M}~{s.work_end:%H:%M}, "
+                    f"주간 {_WEEKDAY_KR[s.weekly_day]} {s.weekly_at:%H:%M}"
+                )
 
         @client.event
         async def on_message(message: discord.Message):

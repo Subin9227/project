@@ -49,6 +49,27 @@ DATA_DIR.mkdir(exist_ok=True)  # data/ 폴더가 없으면 자동 생성
 # 대화기억(체크포인트)을 저장할 SQLite 파일 경로.
 MEMORY_DB_PATH: Path = DATA_DIR / "memory.sqlite"
 
+# --- 알림 (비서가 먼저 거는 말) ---
+# 없으면 알림 기능을 통째로 끈다 (블레이버스·vLLM과 같은 스위치 방식).
+#
+# ALARM_TARGET에는 **받고 싶은 곳의 ID 하나**만 넣으면 된다. 채널이든 사람이든
+# 상관없다 — 디스코드는 둘 다 그냥 숫자라 값만 봐선 구분이 안 되므로, 봇이 켜질 때
+# 채널인지 사람인지 직접 물어봐서 판별한다(alarms.resolve_target).
+#   채널 ID  → 그 채널에 글을 쓴다 (평소 대화방 = 맥락이 안 끊겨서 이쪽이 낫다)
+#   사용자 ID → 그 사람에게 DM
+#
+# ALARM_MENTION은 선택. 채널로 받을 때 알림음이 울리게 붙일 멘션 대상이다.
+# DM으로 받으면 어차피 알림이 오므로 필요 없다.
+# ⚠️ 지금은 .env에서 한 사람 것만 읽는다. #9 Phase 3에서 사용자별 설정으로
+#    옮길 때 alarms.py는 안 건드리고 이 '읽는 곳'만 갈아끼운다.
+#    (그때는 봇이 대화 상대의 ID를 이미 알아서 ALARM_MENTION도 자동으로 채워진다)
+ALARM_TARGET: str | None = os.getenv("ALARM_TARGET") or None
+ALARM_MENTION: str | None = os.getenv("ALARM_MENTION") or None
+WORK_START_TIME: str = os.getenv("WORK_START_TIME", "09:00")
+WORK_END_TIME: str = os.getenv("WORK_END_TIME", "18:00")
+# "요일 시각". 요일은 월=0. 주간 브리핑을 보낼 때.
+WEEKLY_TIME: str = os.getenv("WEEKLY_TIME", "MON 08:00")
+
 # --- 노션 (데일리루틴 사진 인증용) ---
 # "오프라인 데일리 루틴 (2)" 데이터소스 ID.
 # ("비서 전용 페이지" 안의 깨끗한 전용 DB. 하루 1행, 스키마는 옛 DB와 동일.)

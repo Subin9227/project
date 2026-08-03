@@ -18,10 +18,12 @@ import asyncio
 from datetime import datetime, timedelta
 
 import discord
+from discord import app_commands
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.errors import GraphRecursionError
 
+from secretary import users
 from secretary.agent import build_agent
 from secretary.alarms import (
     _WEEKDAY_KR,
@@ -29,7 +31,8 @@ from secretary.alarms import (
     load_schedules,
     resolve_target,
 )
-from secretary.config import DISCORD_BOT_TOKEN, KST, MEMORY_DB_PATH
+from secretary.commands import setup_commands
+from secretary.config import DISCORD_BOT_TOKEN, KST, MEMORY_DB_PATH, OWNER_ID
 from secretary.webserver import build_health_server
 
 # 디스코드 한 메시지의 최대 길이. 초과분은 잘라서 보낸다.
@@ -107,6 +110,21 @@ def _extract_text(message) -> str:
     return text[:DISCORD_MAX_LEN]
 
 
+def _allowed(discord_id: str) -> bool:
+    """이 사람의 말을 받아줄까.
+
+    주인은 언제나 통과한다 — 봇이 .env 자격증명으로 돌기 때문에 주인에게
+    등록을 요구하면 자기 봇에서 자기가 쫓겨난다.
+    등록 기능이 아예 꺼져 있으면(CRED_KEY 없음) 예전처럼 1인 모드로 다 받는다.
+    """
+    if OWNER_ID and discord_id == OWNER_ID:
+        return True
+    if not users.enabled():
+        return True
+    user = users.get(discord_id)
+    return bool(user and user.registered)
+
+
 async def _describe_target(client: discord.Client, schedule) -> str:
     """알림이 실제로 어디로 갈지 사람이 읽을 수 있게.
 
@@ -137,6 +155,10 @@ async def main() -> None:
     intents.message_content = True  # 메시지 본문 읽기 권한
     client = discord.Client(intents=intents)
 
+    # 슬래시 커맨드(/register 등)를 붙인다. discord.Client에는 트리가 없어서 직접 만든다.
+    tree = app_commands.CommandTree(client)
+    setup_commands(tree)
+
     # 대화기억 저장소를 열고, 그 안에서 봇 생애 전체를 돈다.
     # (async with 블록이 유지되는 동안 SQLite 연결이 살아있다.)
     async with AsyncSqliteSaver.from_conn_string(str(MEMORY_DB_PATH)) as checkpointer:
@@ -160,19 +182,37 @@ async def main() -> None:
             print(f"공주비서 로그인 완료: {client.user}")
             print(f"   뇌: {backend}")
 
+            # 슬래시 커맨드를 디스코드에 알린다.
+            # ⚠️ 전역 등록 하나만 한다. copy_global_to로 서버에도 복사하면 디스코드가
+            #    '서버용 한 벌 + 전역 한 벌'을 각각 보여줘서 목록에 두 번씩 뜬다.
+            #    (전역은 DM에서도 보이므로 서버 복사본은 필요 없다)
+            # clear_commands+sync는 예전에 복사해둔 서버 사본을 지우는 청소다.
+            try:
+                for guild in client.guilds:
+                    tree.clear_commands(guild=guild)
+                    await tree.sync(guild=guild)
+                synced = await tree.sync()
+                print("   커맨드: " + " ".join(f"/{c.name}" for c in synced))
+            except Exception as e:  # noqa: BLE001
+                print(f"   ⚠️ 커맨드 등록 실패: {type(e).__name__}: {e}")
+
+            if not users.enabled():
+                print("   등록 기능: 꺼짐 (.env에 CRED_KEY 없음)")
+            print(f"   등록된 사용자: {len(users.all_users()) if users.enabled() else 0}명")
+
             # 알림은 로그인 뒤에 켠다 (DM을 보내려면 게이트웨이가 붙어 있어야 한다).
             # on_ready는 재접속 때도 불리므로 이미 돌고 있으면 다시 켜지 않는다.
             schedules = load_schedules()
             if not schedules:
-                print("   알림: 꺼짐 (.env에 ALARM_TARGET 없음)")
+                print("   알림: 꺼짐 (ALARM_TARGET도 /setup도 없음)")
             elif not alarm_loop.is_running():
                 alarm_loop.start()
-                s = schedules[0]
-                print(f"   알림 대상: {await _describe_target(client, s)}")
-                print(
-                    f"   알림 시각: 업무 {s.work_start:%H:%M}~{s.work_end:%H:%M}, "
-                    f"주간 {_WEEKDAY_KR[s.weekly_day]} {s.weekly_at:%H:%M}"
-                )
+                for s in schedules:
+                    print(f"   알림 → {await _describe_target(client, s)}")
+                    print(
+                        f"        업무 {s.work_start:%H:%M}~{s.work_end:%H:%M}, "
+                        f"주간 {_WEEKDAY_KR[s.weekly_day]} {s.weekly_at:%H:%M}"
+                    )
 
         @client.event
         async def on_message(message: discord.Message):
@@ -196,14 +236,24 @@ async def main() -> None:
             if not user_text:
                 return
 
-            # thread_id = 채널ID + KST 오늘 날짜 → 날짜가 바뀌면 대화가 새로 시작된다.
-            # 자정을 넘기면 맥락이 끊기지만 그게 맞다: _prompt_with_today가 이미 매번
-            # 오늘 날짜를 새로 주입하므로, 안 끊으면 어제 맥락에 오늘 날짜가 섞인다.
+            # 등록 관문. 공개배포라 아무나 말을 걸 수 있으므로, 등록한 사람만 받는다.
+            # (주인은 .env로 도니까 등록 없이 통과 — 안 그러면 주인부터 막힌다)
+            author_id = str(message.author.id)
+            if not _allowed(author_id):
+                await message.reply(
+                    "처음 뵙네요, 아가씨. `/register`로 노션과 연결해 주시면 "
+                    "그때부터 도와드릴게요."
+                )
+                return
+
+            # thread_id = 사용자ID + KST 오늘 날짜.
+            # ⚠️ 채널이 아니라 **사람** 기준이다. 채널로 묶으면 한 채널의 두 사람이
+            #    서로의 대화기억(과 도구 결과)을 보게 된다.
+            # 날짜가 바뀌면 대화가 새로 시작된다. 자정을 넘기면 맥락이 끊기지만 그게
+            # 맞다: _prompt_with_today가 매번 오늘 날짜를 새로 주입하기 때문이다.
             # recursion_limit(겹1)로 스텝 상한을 걸어 무한 재시도를 막는다.
             config = {
-                "configurable": {
-                    "thread_id": f"{message.channel.id}:{_today_kst()}"
-                },
+                "configurable": {"thread_id": f"{author_id}:{_today_kst()}"},
                 "recursion_limit": RECURSION_LIMIT,
             }
 

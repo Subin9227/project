@@ -49,6 +49,21 @@ DATA_DIR.mkdir(exist_ok=True)  # data/ 폴더가 없으면 자동 생성
 # 대화기억(체크포인트)을 저장할 SQLite 파일 경로.
 MEMORY_DB_PATH: Path = DATA_DIR / "memory.sqlite"
 
+# 사용자별 설정·자격증명 저장소. memory.sqlite와 일부러 파일을 나눈다 —
+# 그쪽은 bot.py가 시작할 때 통째로 DELETE/VACUUM 하고, 스키마 주인도 LangGraph다.
+USERS_DB_PATH: Path = DATA_DIR / "users.sqlite"
+
+# --- 소유자 / 자격증명 암호화 (#9 Phase 3) ---
+# OWNER_ID: 봇 주인의 디스코드 사용자 ID. 등록 없이도 쓸 수 있고 /allow를 부를 수 있다.
+#   (이게 없으면 등록자 외에는 아무도 못 쓰는데, 주인 본인부터 막혀버린다)
+OWNER_ID: str | None = os.getenv("OWNER_ID") or None
+
+# CRED_KEY: 남의 자격증명을 암호화할 Fernet 키. `Fernet.generate_key()`로 만든다.
+# ⚠️ 없으면 등록 기능이 통째로 꺼진다. 평문으로 남의 비밀번호를 저장하는 일은 없다.
+# ⚠️ 이건 공격자를 막는 장치가 아니라 `cat users.sqlite`를 막는 장치다.
+#    이 서버에 셸이 뚫리면 .env의 키도 같이 털린다 — 등록 화면에서 그렇게 고지한다.
+CRED_KEY: str | None = os.getenv("CRED_KEY") or None
+
 # --- 알림 (비서가 먼저 거는 말) ---
 # 없으면 알림 기능을 통째로 끈다 (블레이버스·vLLM과 같은 스위치 방식).
 #

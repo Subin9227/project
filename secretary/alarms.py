@@ -40,6 +40,7 @@ from secretary.config import (
     WORK_END_TIME,
     WORK_START_TIME,
 )
+from secretary import users
 from secretary.notion_tools import ITEMS, _headers, _query_rows, routine_today
 
 _WEEKDAYS = {"MON": 0, "TUE": 1, "WED": 2, "THU": 3, "FRI": 4, "SAT": 5, "SUN": 6}
@@ -101,14 +102,19 @@ async def resolve_target(client, target: str) -> tuple[object, str]:
 def load_schedules() -> list[Schedule]:
     """알림을 받을 사람들의 설정.
 
-    Phase 3에서 users 테이블을 읽도록 바꿀 지점. 그때도 반환 타입만 지키면
-    이 파일의 나머지는 손댈 필요가 없다.
+    Phase 2에서 '갈아끼울 지점'으로 남겨둔 함수. 이제 두 곳에서 읽는다:
+      · .env      — 주인 것. 등록 없이 예전처럼 동작
+      · users 표  — /setup으로 등록한 사람들 (Phase 3)
+    alarm_loop·build_message는 이 함수만 보므로 손대지 않았다.
     """
-    if not ALARM_TARGET:
-        return []
-    day, at = _parse_weekly(WEEKLY_TIME)
-    return [
-        Schedule(
+    # 받을 곳을 열쇠로 모은다. 같은 곳에 두 번 보내지 않으려는 것도 있지만,
+    # ⚠️ 더 중요한 건 순서다: 나중에 넣는 쪽이 이긴다. 사용자가 /setup으로 직접
+    #    정한 값이 .env 기본값을 덮어써야 한다. (반대로 하면 /setup이 먹통이 된다)
+    by_target: dict[str, Schedule] = {}
+
+    if ALARM_TARGET:
+        day, at = _parse_weekly(WEEKLY_TIME)
+        by_target[ALARM_TARGET] = Schedule(
             target=ALARM_TARGET,
             mention_id=ALARM_MENTION,
             work_start=_parse_time(WORK_START_TIME),
@@ -116,7 +122,22 @@ def load_schedules() -> list[Schedule]:
             weekly_day=day,
             weekly_at=at,
         )
-    ]
+
+    if users.enabled():
+        for u in users.all_users():
+            # 알림 받을 곳을 안 정했으면 건너뛴다 (/setup을 아직 안 한 사람)
+            if not u.alarm_target:
+                continue
+            day, at = _parse_weekly(u.weekly_at or WEEKLY_TIME)
+            by_target[u.alarm_target] = Schedule(
+                target=u.alarm_target,
+                mention_id=u.alarm_mention,
+                work_start=_parse_time(u.work_start or WORK_START_TIME),
+                work_end=_parse_time(u.work_end or WORK_END_TIME),
+                weekly_day=day,
+                weekly_at=at,
+            )
+    return list(by_target.values())
 
 
 def due_kinds(schedule: Schedule, now: datetime) -> list[str]:

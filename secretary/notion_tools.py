@@ -29,6 +29,7 @@ import httpx
 from langchain_core.tools import tool
 from PIL import Image
 
+from secretary import context
 from secretary.config import (
     KST,
     NOTION_API_BASE,
@@ -93,9 +94,21 @@ def _resolve_item(item: str) -> str | None:
 
 
 # --- 노션 REST 헬퍼 -------------------------------------------------------
+def _routine_ds() -> str:
+    """지금 요청 주인의 루틴 DB.
+
+    ⚠️ `or NOTION_ROUTINE_DS_ID`로 때우지 않는다. 등록했지만 노션을 안 넣은 사람이
+       주인의 DB를 쓰게 된다. 1인 모드는 context.active()가 env_user()를 주므로
+       여기서 폴백할 필요가 없다.
+    """
+    return context.require(context.active().routine_ds_id, "노션")
+
+
 def _headers(json: bool = True) -> dict[str, str]:
+    # ⚠️ 전역 토큰이 아니라 '지금 말 건 사람'의 토큰이다. 이걸 전역으로 두면
+    #    철수가 시킨 일이 아가씨 노션에 기록된다.
     h = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Authorization": f"Bearer {context.require(context.active().notion_token, '노션')}",
         "Notion-Version": NOTION_VERSION,
     }
     if json:
@@ -215,7 +228,7 @@ async def _query_rows(client: httpx.AsyncClient, ds_id: str, filter_: dict) -> l
 async def _find_row(client: httpx.AsyncClient, day: str) -> dict | None:
     """대상 날짜의 데일리루틴 행. 없으면 None (만들지 않는다)."""
     rows = await _query_rows(
-        client, NOTION_ROUTINE_DS_ID, {"property": "날짜", "date": {"equals": day}}
+        client, _routine_ds(), {"property": "날짜", "date": {"equals": day}}
     )
     return rows[0] if rows else None
 
@@ -230,7 +243,7 @@ async def _find_or_create_row(client: httpx.AsyncClient, day: str) -> str:
         f"{NOTION_API_BASE}/pages",
         headers=_headers(),
         json={
-            "parent": {"type": "data_source_id", "data_source_id": NOTION_ROUTINE_DS_ID},
+            "parent": {"type": "data_source_id", "data_source_id": _routine_ds()},
             "properties": {
                 "인증": {"title": [{"text": {"content": day}}]},
                 "날짜": {"date": {"start": day}},
@@ -239,7 +252,7 @@ async def _find_or_create_row(client: httpx.AsyncClient, day: str) -> str:
     )
     create.raise_for_status()
     page_id = create.json()["id"]
-    await _copy_template(client, NOTION_ROUTINE_DS_ID, page_id)
+    await _copy_template(client, _routine_ds(), page_id)
     return page_id
 
 
@@ -464,7 +477,7 @@ async def attach_routine_photo(
     except httpx.HTTPStatusError as e:
         return f"노션 처리 중 오류가 났어요 ({e.response.status_code}): {e.response.text[:300]}"
     except Exception as e:  # noqa: BLE001 - 도구는 예외를 문자열로 돌려줘야 에이전트가 전달함
-        return f"처리 중 예상치 못한 오류: {type(e).__name__}: {e}"
+        return context.as_message(e, "처리 중 예상치 못한 오류")
 
 
 @tool
@@ -502,7 +515,7 @@ async def routine_today(date: str = "today") -> str:
     except httpx.HTTPStatusError as e:
         return f"노션 조회 중 오류 ({e.response.status_code}): {e.response.text[:200]}"
     except Exception as e:  # noqa: BLE001
-        return f"처리 중 예상치 못한 오류: {type(e).__name__}: {e}"
+        return context.as_message(e, "처리 중 예상치 못한 오류")
 
 
 @tool
@@ -539,7 +552,7 @@ async def routine_check(item: str, checked: bool = True, date: str = "today") ->
     except httpx.HTTPStatusError as e:
         return f"노션 처리 중 오류 ({e.response.status_code}): {e.response.text[:200]}"
     except Exception as e:  # noqa: BLE001
-        return f"처리 중 예상치 못한 오류: {type(e).__name__}: {e}"
+        return context.as_message(e, "처리 중 예상치 못한 오류")
 
 
 @tool
@@ -609,7 +622,7 @@ async def routine_write(
     except httpx.HTTPStatusError as e:
         return f"노션 처리 중 오류 ({e.response.status_code}): {e.response.text[:200]}"
     except Exception as e:  # noqa: BLE001
-        return f"처리 중 예상치 못한 오류: {type(e).__name__}: {e}"
+        return context.as_message(e, "처리 중 예상치 못한 오류")
 
 
 # agent.py가 가져다 쓰는 도구 목록

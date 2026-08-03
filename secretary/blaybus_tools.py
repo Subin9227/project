@@ -35,11 +35,14 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 import httpx
 from langchain_core.tools import tool
 
+from secretary import context
 from secretary.config import (
     BLAYBUS_API_BASE,
     BLAYBUS_LOGIN_ID,
@@ -53,13 +56,37 @@ _ORIGIN_HEADERS = {
     "x-client-platform": "web",
 }
 
-_client: httpx.AsyncClient | None = None
+# 사람마다 쿠키함을 따로 둔다.
+# ⚠️ 예전엔 _client 하나를 전원이 공유했다. 그러면 철수의 401 재로그인이 아가씨의
+#    쿠키를 덮어써서, 두 사람 요청이 서로를 로그아웃시킨다.
+_clients: dict[str, httpx.AsyncClient] = {}
+# ⚠️ 잠금이 없으면 같은 사람의 요청 둘이 동시에 '아직 클라이언트가 없네'를 보고
+#    둘 다 로그인한다(check-then-await-then-assign 경쟁). 1인일 땐 안 보이지만
+#    사람이 늘면 확정적으로 터진다. 단일 이벤트루프라 defaultdict로 충분하다.
+_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 
-async def _login(client: httpx.AsyncClient) -> None:
+def _creds() -> tuple[str, str | None, str | None]:
+    """(쿠키함 열쇠, 아이디, 비밀번호). 열쇠는 사람마다 달라야 한다.
+
+    ⚠️ 예전엔 `or BLAYBUS_LOGIN_ID`로 폴백했다. 그래서 블레이버스를 등록하지 않은
+       사람이 "내 블레이버스 뭐야?"라고 묻자 **주인 계정의 아젠다가 그대로 나왔다**
+       (2계정 테스트에서 실제 발생). 조회라 다행이었지 '시작해줘'였으면 주인
+       계정에 남의 시간이 기록됐다. 1인 모드는 active()가 env_user()를 주므로
+       여기서 때울 필요가 없다.
+    """
+    me = context.active()
+    return me.discord_id, me.blaybus_id, me.blaybus_pw
+
+
+def _project_id() -> str:
+    return context.require(context.active().blaybus_pid, "블레이버스")
+
+
+async def _login(client: httpx.AsyncClient, login_id: str, password: str) -> None:
     resp = await client.post(
         "/auth/user/sign-in",
-        json={"loginId": BLAYBUS_LOGIN_ID, "password": BLAYBUS_PASSWORD},
+        json={"loginId": login_id, "password": password},
         headers=_ORIGIN_HEADERS,
     )
     resp.raise_for_status()  # 쿠키 3종은 client.cookies에 자동 저장된다
@@ -70,19 +97,29 @@ async def _request(method: str, path: str, **kwargs) -> httpx.Response:
 
     재시도를 1회로 못 박은 이유: 비밀번호가 틀렸거나 계정이 잠긴 경우에도 401이
     오는데, 그때 무한 재로그인하면 계정 잠금을 스스로 부른다.
+    ⚠️ 이제 남의 계정도 다루므로 이 규칙이 더 중요하다 — 되풀이하면 남의 계정을
+       잠근다.
     """
-    global _client
-    if _client is None:
-        _client = httpx.AsyncClient(base_url=BLAYBUS_API_BASE, timeout=20.0)
-        await _login(_client)
+    key, login_id, password = _creds()
+    context.require(login_id and password, "블레이버스")
+
+    async with _locks[key]:
+        client = _clients.get(key)
+        if client is None:
+            client = httpx.AsyncClient(base_url=BLAYBUS_API_BASE, timeout=20.0)
+            await _login(client, login_id, password)
+            _clients[key] = client
 
     def _headers() -> dict[str, str]:
-        return {**_ORIGIN_HEADERS, "x-csrf-token": _client.cookies.get("cs_token", "")}
+        return {**_ORIGIN_HEADERS, "x-csrf-token": client.cookies.get("cs_token", "")}
 
-    resp = await _client.request(method, path, headers=_headers(), **kwargs)
+    resp = await client.request(method, path, headers=_headers(), **kwargs)
     if resp.status_code == 401:
-        await _login(_client)
-        resp = await _client.request(method, path, headers=_headers(), **kwargs)
+        # 재로그인도 잠금 안에서. 밖에서 하면 같은 사람의 다른 요청이 그 사이
+        # 반쯤 갱신된 쿠키를 쓴다.
+        async with _locks[key]:
+            await _login(client, login_id, password)
+        resp = await client.request(method, path, headers=_headers(), **kwargs)
     return resp
 
 
@@ -136,7 +173,7 @@ async def _tree() -> list[dict]:
     빼면 기본값이 completed=false라 끝난 아젠다가 통째로 안 보인다(9개→4개).
     """
     resp = await _request(
-        "GET", f"/project/{BLAYBUS_PROJECT_ID}/agenda?completed=true&page=1&pageSize=100"
+        "GET", f"/project/{_project_id()}/agenda?completed=true&page=1&pageSize=100"
     )
     resp.raise_for_status()
     return resp.json()["data"]["list"]
@@ -200,7 +237,7 @@ async def blaybus_status() -> str:
         resp.raise_for_status()
         sessions = resp.json()["data"]["list"]
     except Exception as e:  # noqa: BLE001 - 도구는 예외를 문자열로 돌려줘야 전달된다
-        return f"블레이버스 상태를 못 봤어요: {type(e).__name__}: {e}"
+        return context.as_message(e, "블레이버스 상태를 못 봤어요")
 
     if not sessions:
         return "지금 블레이버스에 돌아가는 시간기록이 없어요."
@@ -224,11 +261,11 @@ async def blaybus_start(task_title: str) -> str:
         처리 결과 문자열.
     """
     try:
-        resp = await _request("GET", f"/project/{BLAYBUS_PROJECT_ID}/task")
+        resp = await _request("GET", f"/project/{_project_id()}/task")
         resp.raise_for_status()
         tasks = resp.json()["data"]["list"]
     except Exception as e:  # noqa: BLE001
-        return f"블레이버스 태스크 목록을 못 봤어요: {type(e).__name__}: {e}"
+        return context.as_message(e, "블레이버스 태스크 목록을 못 봤어요")
 
     picked = _pick_task(tasks, task_title)
     if isinstance(picked, list):
@@ -242,7 +279,7 @@ async def blaybus_start(task_title: str) -> str:
         resp = await _request("POST", f"/task/{picked['id']}/session/start")
         resp.raise_for_status()
     except Exception as e:  # noqa: BLE001
-        return f"'{picked['title']}' 시작에 실패했어요: {type(e).__name__}: {e}"
+        return context.as_message(e, "'{picked['title']}' 시작에 실패했어요")
     return f"블레이버스에서 '{picked['title']}' 시간기록을 시작했어요."
 
 
@@ -261,7 +298,7 @@ async def blaybus_stop() -> str:
         resp.raise_for_status()
         sessions = resp.json()["data"]["list"]
     except Exception as e:  # noqa: BLE001
-        return f"블레이버스 상태를 못 봤어요: {type(e).__name__}: {e}"
+        return context.as_message(e, "블레이버스 상태를 못 봤어요")
 
     if not sessions:
         return "지금 돌아가는 시간기록이 없어요. 멈출 게 없네요."
@@ -273,7 +310,7 @@ async def blaybus_stop() -> str:
             resp.raise_for_status()
             stopped.append(f"'{s['taskTitle']}' ({_duration(s['elapsedSeconds'])})")
         except Exception as e:  # noqa: BLE001
-            return f"'{s['taskTitle']}' 중지에 실패했어요: {type(e).__name__}: {e}"
+            return context.as_message(e, "'{s['taskTitle']}' 중지에 실패했어요")
     return f"블레이버스 시간기록을 멈췄어요: {', '.join(stopped)}"
 
 
@@ -294,7 +331,7 @@ async def blaybus_list(agenda_title: str | None = None) -> str:
     try:
         tree = await _tree()
     except Exception as e:  # noqa: BLE001
-        return f"블레이버스 목록을 못 봤어요: {type(e).__name__}: {e}"
+        return context.as_message(e, "블레이버스 목록을 못 봤어요")
 
     if not tree:
         return "블레이버스에 아젠다가 하나도 없어요."
@@ -336,11 +373,11 @@ async def blaybus_add_agenda(title: str) -> str:
     """
     try:
         resp = await _request(
-            "POST", f"/project/{BLAYBUS_PROJECT_ID}/agenda", json={"title": title}
+            "POST", f"/project/{_project_id()}/agenda", json={"title": title}
         )
         resp.raise_for_status()
     except Exception as e:  # noqa: BLE001
-        return f"아젠다 '{title}' 생성에 실패했어요: {type(e).__name__}: {e}"
+        return context.as_message(e, "아젠다 '{title}' 생성에 실패했어요")
     return f"블레이버스에 아젠다 '{title}'를 만들었어요."
 
 
@@ -361,7 +398,7 @@ async def blaybus_add_work(work_title: str, agenda_title: str, date: str | None 
     try:
         tree = await _tree()
     except Exception as e:  # noqa: BLE001
-        return f"블레이버스 목록을 못 봤어요: {type(e).__name__}: {e}"
+        return context.as_message(e, "블레이버스 목록을 못 봤어요")
 
     agenda, err = _resolve(tree, agenda_title, "아젠다")
     if err:
@@ -370,12 +407,12 @@ async def blaybus_add_work(work_title: str, agenda_title: str, date: str | None 
     try:
         resp = await _request(
             "POST",
-            f"/project/{BLAYBUS_PROJECT_ID}/agenda/{agenda['id']}/work",
+            f"/project/{_project_id()}/agenda/{agenda['id']}/work",
             json={"title": work_title, "date": _due(date)},
         )
         resp.raise_for_status()
     except Exception as e:  # noqa: BLE001
-        return f"워크 '{work_title}' 생성에 실패했어요: {type(e).__name__}: {e}"
+        return context.as_message(e, "워크 '{work_title}' 생성에 실패했어요")
     return f"아젠다 '{agenda['title']}'에 워크 '{work_title}'를 만들었어요."
 
 
@@ -398,7 +435,7 @@ async def blaybus_add_task(task_title: str, work_title: str | None = None) -> st
         tree = await _tree()
         assignee = await _my_id()
     except Exception as e:  # noqa: BLE001
-        return f"블레이버스 정보를 못 봤어요: {type(e).__name__}: {e}"
+        return context.as_message(e, "블레이버스 정보를 못 봤어요")
 
     works = [(a, w) for a in tree for w in (a.get("works") or [])]
     if work_title:
@@ -417,7 +454,7 @@ async def blaybus_add_task(task_title: str, work_title: str | None = None) -> st
     try:
         resp = await _request(
             "POST",
-            f"/project/{BLAYBUS_PROJECT_ID}/task",
+            f"/project/{_project_id()}/task",
             json={
                 "title": task_title,
                 "assignee": assignee,
@@ -428,7 +465,7 @@ async def blaybus_add_task(task_title: str, work_title: str | None = None) -> st
         )
         resp.raise_for_status()
     except Exception as e:  # noqa: BLE001
-        return f"태스크 '{task_title}' 생성에 실패했어요: {type(e).__name__}: {e}"
+        return context.as_message(e, "태스크 '{task_title}' 생성에 실패했어요")
     return f"워크 '{work['title']}'에 태스크 '{task_title}'를 만들었어요."
 
 
@@ -453,7 +490,7 @@ async def blaybus_rename(old_title: str, new_title: str, kind: str | None = None
     try:
         pairs = _flatten(await _tree())
     except Exception as e:  # noqa: BLE001
-        return f"블레이버스 목록을 못 봤어요: {type(e).__name__}: {e}"
+        return context.as_message(e, "블레이버스 목록을 못 봤어요")
 
     if kind:
         pairs = [p for p in pairs if p[0] == kind]
@@ -467,12 +504,12 @@ async def blaybus_rename(old_title: str, new_title: str, kind: str | None = None
         return f"'{old_title}'에 해당하는 게 여럿이에요: {names}. 어느 걸로 할까요?"
 
     found_kind, item = hits[0]
-    path = _RENAME_PATHS[found_kind].format(pid=BLAYBUS_PROJECT_ID, id=item["id"])
+    path = _RENAME_PATHS[found_kind].format(pid=_project_id(), id=item["id"])
     try:
         resp = await _request("POST", path, json={"title": new_title})
         resp.raise_for_status()
     except Exception as e:  # noqa: BLE001
-        return f"이름 변경에 실패했어요: {type(e).__name__}: {e}"
+        return context.as_message(e, "이름 변경에 실패했어요")
     return f"{_KIND_KR[found_kind]} '{item['title']}'를 '{new_title}'로 바꿨어요."
 
 
@@ -522,7 +559,7 @@ async def blaybus_today_tasks(date: str = "today") -> str:
             active.raise_for_status()
             running = active.json()["data"]["list"]
     except Exception as e:  # noqa: BLE001
-        return f"블레이버스 조회 중 오류: {type(e).__name__}: {e}"
+        return context.as_message(e, "블레이버스 조회 중 오류")
 
     if not done and not running:
         return f"{day}에 블레이버스로 시간을 잰 태스크가 없어요."

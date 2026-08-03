@@ -19,6 +19,7 @@ from __future__ import annotations
 import httpx
 from langchain_core.tools import tool
 
+from secretary import context
 from secretary.config import KST, NOTION_API_BASE, NOTION_HOMEWORK_DS_ID
 from secretary.notion_tools import (
     _copy_template,
@@ -33,6 +34,11 @@ from datetime import datetime
 # ⚠️ '승인'·'반려'는 강사가 정한다 — 봇이 쓰면 사실과 달라지므로 도구로 열지 않는다.
 STATUS_DOING = "진행중"
 STATUS_DONE = "진행완료"
+
+
+def _homework_ds() -> str:
+    """지금 요청 주인의 과제 DB. 없으면 안내(남의 DB로 때우지 않는다)."""
+    return context.require(context.active().homework_ds_id, "과제 노션")
 
 
 def _week_str(week: str | int) -> str:
@@ -61,7 +67,7 @@ def _nice_error(e: httpx.HTTPStatusError) -> str:
 
 async def _find_week_row(client: httpx.AsyncClient, week: str) -> dict | None:
     rows = await _query_rows(
-        client, NOTION_HOMEWORK_DS_ID, {"property": "주차", "select": {"equals": week}}
+        client, _homework_ds(), {"property": "주차", "select": {"equals": week}}
     )
     return rows[0] if rows else None
 
@@ -97,7 +103,7 @@ async def homework_status(week: str = "") -> str:
                 return _row_summary(row)
 
             resp = await client.post(
-                f"{NOTION_API_BASE}/data_sources/{NOTION_HOMEWORK_DS_ID}/query",
+                f"{NOTION_API_BASE}/data_sources/{_homework_ds()}/query",
                 headers=_headers(),
                 json={},
             )
@@ -109,7 +115,7 @@ async def homework_status(week: str = "") -> str:
     except httpx.HTTPStatusError as e:
         return _nice_error(e)
     except Exception as e:  # noqa: BLE001
-        return f"처리 중 예상치 못한 오류: {type(e).__name__}: {e}"
+        return context.as_message(e, "처리 중 예상치 못한 오류")
 
 
 @tool
@@ -141,7 +147,7 @@ async def homework_create(week: str, title: str = "") -> str:
                 json={
                     "parent": {
                         "type": "data_source_id",
-                        "data_source_id": NOTION_HOMEWORK_DS_ID,
+                        "data_source_id": _homework_ds(),
                     },
                     "properties": {
                         "제목": {"title": [{"text": {"content": title or f"{w}주차 과제"}}]},
@@ -153,7 +159,7 @@ async def homework_create(week: str, title: str = "") -> str:
             )
             create.raise_for_status()
             page_id = create.json()["id"]
-            blocks = await _copy_template(client, NOTION_HOMEWORK_DS_ID, page_id)
+            blocks = await _copy_template(client, _homework_ds(), page_id)
         return (
             f"{w}주차 과제 행을 만들고 '{STATUS_DOING}'으로 뒀어요. "
             f"(템플릿 {blocks}칸)"
@@ -161,7 +167,7 @@ async def homework_create(week: str, title: str = "") -> str:
     except httpx.HTTPStatusError as e:
         return _nice_error(e)
     except Exception as e:  # noqa: BLE001
-        return f"처리 중 예상치 못한 오류: {type(e).__name__}: {e}"
+        return context.as_message(e, "처리 중 예상치 못한 오류")
 
 
 @tool
@@ -212,7 +218,7 @@ async def homework_write(week: str, section: str, text: str) -> str:
     except httpx.HTTPStatusError as e:
         return _nice_error(e)
     except Exception as e:  # noqa: BLE001
-        return f"처리 중 예상치 못한 오류: {type(e).__name__}: {e}"
+        return context.as_message(e, "처리 중 예상치 못한 오류")
 
 
 @tool
@@ -253,7 +259,7 @@ async def homework_complete(week: str) -> str:
     except httpx.HTTPStatusError as e:
         return _nice_error(e)
     except Exception as e:  # noqa: BLE001
-        return f"처리 중 예상치 못한 오류: {type(e).__name__}: {e}"
+        return context.as_message(e, "처리 중 예상치 못한 오류")
 
 
 HOMEWORK_TOOLS = [

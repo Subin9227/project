@@ -20,8 +20,6 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.prebuilt import create_react_agent
 
 from secretary.config import (
-    BLAYBUS_LOGIN_ID,
-    BLAYBUS_PASSWORD,
     CLAUDE_MODEL,
     KST,
     MAX_TOKENS,
@@ -82,22 +80,33 @@ def _prompt_with_today(state):
     return [SystemMessage(content=SYSTEM_PROMPT + today_line), *recent]
 
 
-def _build_model():
-    """뇌로 쓸 모델 어댑터를 고른다. 기본 Claude, VLLM_BASE_URL이 있으면 로컬 vLLM.
+def _build_model(user):
+    """그 사람의 뇌를 만든다. 등록 안 한 주인이면 .env 값이 들어온다.
 
-    vLLM은 OpenAI 호환 서버라 base_url만 갈아끼우면 붙는다 — 그래서 아래 그래프
-    조립부는 한 줄도 바뀌지 않는다.
+    vLLM·OpenAI 둘 다 OpenAI 호환이라 base_url만 갈아끼우면 붙는다 — 그래서
+    아래 그래프 조립부는 한 줄도 바뀌지 않는다.
     """
-    if not VLLM_BASE_URL:
-        return ChatAnthropic(model=CLAUDE_MODEL, max_tokens=MAX_TOKENS)
+    if user.llm_provider == "anthropic":
+        return ChatAnthropic(
+            model=user.llm_model or CLAUDE_MODEL,
+            api_key=user.llm_key,
+            max_tokens=MAX_TOKENS,
+        )
 
-    # 로컬 모델을 쓸 때만 필요한 의존성이라 여기서 늦게 import한다.
+    # OpenAI/vLLM 쪽만 필요한 의존성이라 여기서 늦게 import한다.
     from langchain_openai import ChatOpenAI
 
+    if user.llm_provider == "openai":
+        return ChatOpenAI(
+            model=user.llm_model or "gpt-4o-mini",
+            api_key=user.llm_key,
+            max_tokens=MAX_TOKENS,
+        )
+
     return ChatOpenAI(
-        model=VLLM_MODEL,
-        base_url=VLLM_BASE_URL,
-        api_key=VLLM_API_KEY,
+        model=user.llm_model or VLLM_MODEL,
+        base_url=user.vllm_base_url or VLLM_BASE_URL,
+        api_key=user.llm_key or VLLM_API_KEY,
         max_tokens=MAX_TOKENS,
         temperature=0.7,
         # Qwen3.5는 thinking이 기본 ON인데, 켜두면 짧은 질문에도 2048토큰·72초를
@@ -106,38 +115,50 @@ def _build_model():
     )
 
 
-async def build_agent(checkpointer):
-    """에이전트(컴파일된 LangGraph)를 만들어 돌려준다.
+def build_tools() -> list:
+    """도구 목록. 누구에게나 똑같다.
+
+    ⚠️ 예전엔 블레이버스 자격증명이 있을 때만 붙였는데, 사람마다 있고 없고가
+       다르면 그래프 모양까지 사람마다 달라진다. 그래서 **항상 다 붙이고**,
+       계정이 없으면 도구가 "등록해 주세요"라고 답하게 한다.
+       덕분에 그래프는 모델만 다르면 되고, 캐시가 훨씬 잘 듣는다.
+    """
+    from secretary.blaybus_tools import BLAYBUS_TOOLS
+
+    return ROUTINE_TOOLS + HOMEWORK_TOOLS + BLAYBUS_TOOLS
+
+
+# 모델이 같으면 그래프도 같으니 재사용한다. 열쇠는 '뇌의 생김새'다.
+# MCP를 걷어낸 덕분에 그래프 하나에 node 프로세스가 딸려오지 않아 가볍다.
+# ponytail: 상한 없음. 등록자가 수백 명이 되면 LRU로 바꾼다.
+_agents: dict[tuple, object] = {}
+
+
+async def build_agent(checkpointer, user=None):
+    """그 사람의 에이전트(컴파일된 LangGraph)를 돌려준다. 같은 뇌면 재사용.
 
     Args:
         checkpointer: 대화기억 저장소(SqliteSaver). bot.py에서 열어서 넘겨준다.
+        user: 이 요청의 주인. 없으면 .env 설정(1인 모드).
 
     Returns:
         agent: .ainvoke({"messages": [...]}, config)로 호출하는 실행 가능한 그래프.
     """
-    # 1) 모델 어댑터. 기본은 Claude, .env에 VLLM_BASE_URL이 있으면 로컬 Qwen.
-    model = _build_model()
+    from secretary import context
 
-    # 2) 도구 장착. 전부 노션 REST를 직접 부르는 전용 도구다.
-    #    노션 MCP 서버(범용 도구 24개)는 #9 Phase 1에서 걷어냈다:
-    #      · 매 요청에 스키마 24개가 실려 비쌌고, 작은 모델은 그중에서 잘 못 골랐다
-    #      · MCP는 토큰이 subprocess 실행 시점에 고정되어 사용자별 노션이 불가능하다
-    tools = ROUTINE_TOOLS + HOMEWORK_TOOLS
-    if BLAYBUS_LOGIN_ID and BLAYBUS_PASSWORD:
-        # 계정 정보가 있을 때만 붙인다. 없으면 봇은 예전 그대로 (vLLM 스위치와 같은 방식).
-        from secretary.blaybus_tools import BLAYBUS_TOOLS
-
-        tools = tools + BLAYBUS_TOOLS
-
-    # 3) 모델 + 도구 + 페르소나 + 기억을 묶어 에이전트를 만든다.
-    #    prompt에 고정 문자열 대신 함수(_prompt_with_today)를 주어, 매 메시지마다
-    #    '아가씨 말투 + 오늘 날짜'가 담긴 시스템 메시지를 새로 생성해 주입한다.
-    print(f"   도구: {len(tools)}개 — " + ", ".join(t.name for t in tools))
+    user = user or context.env_user()
+    # ⚠️ llm_key도 열쇠에 넣어야 한다. 빼면 provider·model이 같은 두 사람이 그래프를
+    #    공유하게 되고, 먼저 만든 사람의 키로 남의 요청이 나간다.
+    key = (user.llm_provider, user.llm_model, user.vllm_base_url, user.llm_key)
+    cached = _agents.get(key)
+    if cached is not None:
+        return cached
 
     agent = create_react_agent(
-        model,
-        tools,
+        _build_model(user),
+        build_tools(),
         prompt=_prompt_with_today,  # 페르소나 + 그 순간의 오늘 날짜
         checkpointer=checkpointer,  # thread_id별로 대화 상태를 저장/복원
     )
+    _agents[key] = agent
     return agent

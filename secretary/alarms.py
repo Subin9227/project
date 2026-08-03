@@ -35,13 +35,18 @@ from secretary.config import (
     ALARM_TARGET,
     KST,
     NOTION_API_BASE,
-    NOTION_ROUTINE_DS_ID,
     WEEKLY_TIME,
     WORK_END_TIME,
     WORK_START_TIME,
 )
-from secretary import users
-from secretary.notion_tools import ITEMS, _headers, _query_rows, routine_today
+from secretary import context, users
+from secretary.notion_tools import (
+    ITEMS,
+    _headers,
+    _query_rows,
+    _routine_ds,
+    routine_today,
+)
 
 _WEEKDAYS = {"MON": 0, "TUE": 1, "WED": 2, "THU": 3, "FRI": 4, "SAT": 5, "SUN": 6}
 _WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
@@ -72,6 +77,9 @@ class Schedule:
     work_end: time
     weekly_day: int
     weekly_at: time
+    # 이 알림의 주인. 메시지를 만들 때 이 사람의 노션·블레이버스를 봐야 한다.
+    # None이면 .env 설정(주인의 1인 모드).
+    owner: object | None = None
 
     @property
     def prefix(self) -> str:
@@ -136,6 +144,7 @@ def load_schedules() -> list[Schedule]:
                 work_end=_parse_time(u.work_end or WORK_END_TIME),
                 weekly_day=day,
                 weekly_at=at,
+                owner=u,
             )
     return list(by_target.values())
 
@@ -170,10 +179,11 @@ async def _blaybus_state() -> tuple[str, bool]:
     문구를 다듬는 순간 조용히 깨진다. 세션 목록이 비었는지로 직접 판단한다.
     """
     try:
-        from secretary.blaybus_tools import BLAYBUS_LOGIN_ID, _duration, _request
+        from secretary.blaybus_tools import _duration, _request
     except Exception:  # noqa: BLE001
         return "", False
-    if not BLAYBUS_LOGIN_ID:
+    # ⚠️ 전역이 아니라 '이 알림의 주인'에게 블레이버스 계정이 있는지를 본다.
+    if not context.active().blaybus_id:
         return "", False
     try:
         resp = await _request("GET", "/task-session/active")
@@ -212,7 +222,7 @@ async def _last_week_summary(now: datetime) -> str:
         async with httpx.AsyncClient(timeout=30.0) as client:
             rows = await _query_rows(
                 client,
-                NOTION_ROUTINE_DS_ID,
+                _routine_ds(),  # ⚠️ 전역이 아니라 이 알림 주인의 루틴 DB
                 {
                     "and": [
                         {"property": "날짜", "date": {"on_or_after": start}},
@@ -261,9 +271,9 @@ async def build_message(kind: str, now: datetime) -> str:
         if running:
             lines.append("아직 돌고 있어요. 멈추시려면 '중지해줘'라고 하시면 돼요.")
         try:
-            from secretary.blaybus_tools import BLAYBUS_LOGIN_ID, blaybus_today_tasks
+            from secretary.blaybus_tools import blaybus_today_tasks
 
-            if BLAYBUS_LOGIN_ID:
+            if context.active().blaybus_id:
                 lines.append("\n[오늘 한 일]\n" + await blaybus_today_tasks.ainvoke({}))
         except Exception:  # noqa: BLE001
             pass
@@ -300,12 +310,17 @@ def build_alarm_loop(client):
                 if key in sent:
                     continue
                 sent.add(key)
+                # 알림 본문은 노션·블레이버스를 조회해서 만든다. 그 조회가 **이 알림의
+                # 주인** 것이어야 한다 — 안 심으면 전원의 알림에 주인 데이터가 실린다.
+                ctx_token = context.set_current(schedule.owner)
                 try:
                     dest, _ = await resolve_target(client, schedule.target)
                     await dest.send(schedule.prefix + await build_message(kind, now))
                     print(f"[알림] {kind} → {dest}")
                 except Exception:  # noqa: BLE001 - 알림이 터져도 봇은 살아야 한다
                     traceback.print_exc()
+                finally:
+                    context.reset(ctx_token)
         # 어제 것까지만 들고 있으면 충분하다 (무한 증식 방지)
         for key in [k for k in sent if k[0] != today]:
             sent.discard(key)

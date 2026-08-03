@@ -130,6 +130,12 @@ class RegisterModal(discord.ui.Modal):
             return
 
         report.append("\n다음은 `/setup`으로 알림 시각을 정해 주세요.")
+        # 공개 채널에서 여러 명이 쓰면 답변이 서로 보인다. 코드로 막지 않고 안내한다
+        # (일반 메시지 답장은 ephemeral이 안 되고, 막으면 1인 사용이 불편해진다).
+        report.append(
+            "💬 대화는 저에게 **DM**으로 거시는 걸 권해요. "
+            "채널에서 하면 제 답변이 다른 분께도 보여요."
+        )
         await interaction.followup.send("\n".join(report), ephemeral=True)
 
 

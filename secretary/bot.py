@@ -23,8 +23,8 @@ from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.errors import GraphRecursionError
 
-from secretary import users
-from secretary.agent import build_agent
+from secretary import context, users
+from secretary.agent import build_agent, build_tools
 from secretary.alarms import (
     _WEEKDAY_KR,
     build_alarm_loop,
@@ -167,7 +167,10 @@ async def main() -> None:
             size_mb = MEMORY_DB_PATH.stat().st_size / 1024 / 1024
             print(f"낡은 대화기억 {pruned}개 정리 완료 (현재 {size_mb:.1f}MB)")
 
+        # 주인 몫을 미리 하나 만들어 둔다(도구 개수를 기동 로그에 찍기 위해서도).
+        # 등록한 사람의 에이전트는 그 사람이 말을 걸 때 만들어져 캐시된다.
         agent = await build_agent(checkpointer)
+        print(f"   도구: {len(build_tools())}개")
         alarm_loop = build_alarm_loop(client)
 
         @client.event
@@ -246,6 +249,11 @@ async def main() -> None:
                 )
                 return
 
+            # 이 요청의 주인을 심는다. 여기서부터 도구들이 이 사람의 노션·블레이버스를
+            # 쓴다. 등록 안 한 주인이면 None이라 .env 설정으로 돈다(1인 모드).
+            me = users.get(author_id) if users.enabled() else None
+            ctx_token = context.set_current(me)
+
             # thread_id = 사용자ID + KST 오늘 날짜.
             # ⚠️ 채널이 아니라 **사람** 기준이다. 채널로 묶으면 한 채널의 두 사람이
             #    서로의 대화기억(과 도구 결과)을 보게 된다.
@@ -261,10 +269,12 @@ async def main() -> None:
             #   겹2 = asyncio.wait_for 벽시계 타임아웃
             #   겹3 = 예외를 잡아 크래시/무한대기 대신 페르소나 사과 답장
             try:
+                # 이 사람의 뇌로 도는 에이전트. 뇌가 같으면 같은 그래프를 재사용한다.
+                mine = await build_agent(checkpointer, me)
                 # 답하는 동안 디스코드에 '입력 중...' 표시
                 async with message.channel.typing():
                     result = await asyncio.wait_for(
-                        agent.ainvoke(
+                        mine.ainvoke(
                             {"messages": [HumanMessage(content=user_text)]},
                             config,
                         ),
@@ -285,6 +295,10 @@ async def main() -> None:
                 )
             except Exception as e:  # noqa: BLE001 - 무엇이 터지든 봇은 살아남아 다음 메시지를 받아야 함
                 reply_text = f"처리 중 문제가 생겼어요, 아가씨. ({type(e).__name__})"
+            finally:
+                # 심어둔 주인을 반드시 걷어낸다. 안 걷으면 이 Task가 재사용될 때
+                # 남의 설정이 남아 있을 수 있다.
+                context.reset(ctx_token)
 
             await message.reply(reply_text)
 

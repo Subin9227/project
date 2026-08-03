@@ -112,6 +112,52 @@ def pick_databases(found: list[dict]) -> tuple[str | None, str | None]:
     return routine, homework
 
 
+# 제공자별 기본 모델. /setup으로 바꾸기 전까지 이 값이 쓰인다.
+DEFAULT_MODEL = {"anthropic": "claude-sonnet-4-5", "openai": "gpt-4o-mini"}
+
+
+async def verify_llm(provider: str, secret: str, model: str | None = None) -> str | None:
+    """LLM 키(또는 vLLM 주소)와 모델명이 진짜 되는지. 되면 None, 안 되면 에러문장.
+
+    왜 필요한가:
+        노션·블레이버스는 등록할 때 검증하는데 LLM만 안 했다. 그래서 키 칸에
+        `hello`를 넣어도 그대로 저장됐고, 대화할 때가 되어서야 AuthenticationError가
+        떴다. 사용자는 뭐가 잘못됐는지 알 수 없다.
+        모델명도 같다 — 오타를 내면 대화할 때 NotFoundError만 뜬다.
+
+    ⚠️ 가장 싼 호출로 확인한다(max_tokens=1). 목록 조회 API를 쓰지 않는 이유는
+       제공자마다 경로가 달라서다 — 실제로 쓸 경로로 확인하는 게 정확하다.
+    """
+    name_wanted = model or DEFAULT_MODEL.get(provider) or "x"
+    try:
+        if provider == "anthropic":
+            from langchain_anthropic import ChatAnthropic
+
+            llm = ChatAnthropic(model=name_wanted, api_key=secret, max_tokens=1)
+        elif provider == "openai":
+            from langchain_openai import ChatOpenAI
+
+            llm = ChatOpenAI(model=name_wanted, api_key=secret, max_tokens=1)
+        else:  # vllm — secret이 키가 아니라 서버 주소다
+            from langchain_openai import ChatOpenAI
+
+            llm = ChatOpenAI(
+                model=name_wanted, base_url=secret, api_key="not-needed", max_tokens=1
+            )
+        await llm.ainvoke("hi")
+    except Exception as e:  # noqa: BLE001
+        name = type(e).__name__
+        if "Authentication" in name or "PermissionDenied" in name:
+            return "API 키가 거부됐어요. 키를 다시 확인해 주세요."
+        # 키는 멀쩡한데 모델 이름이 틀린 경우를 구분해준다 (오타·없는 모델)
+        if "NotFound" in name or "model" in str(e).lower():
+            return f"'{name_wanted}' 모델을 못 찾았어요. 이름을 다시 확인해 주세요."
+        if provider == "vllm":
+            return f"그 주소로 못 붙었어요: {name}"
+        return f"확인 중 오류: {name}: {str(e)[:150]}"
+    return None
+
+
 async def verify_blaybus(login_id: str, password: str) -> tuple[list[dict], str | None]:
     """블레이버스 로그인 + 프로젝트 목록. 실패하면 (,, 에러문장).
 
@@ -170,6 +216,18 @@ def _selftest() -> None:
     assert pick_databases([]) == (None, None)
     # 반환이 tuple인지까지 본다 — len()만 세면 틀린 이유로 통과한다 (#8-2 함정)
     assert isinstance(pick_databases(found), tuple)
+
+    # 키 검증: 틀린 키는 '거부됐다'고 말해야 한다 (네트워크를 타므로 결과만 본다)
+    import asyncio
+
+    msg = asyncio.run(verify_llm("anthropic", "hello"))
+    assert isinstance(msg, str) and "거부" in msg, msg
+    # 붙을 수 없는 주소는 키 문제가 아니라 연결 문제로 구분해서 알려야 한다
+    msg = asyncio.run(verify_llm("vllm", "http://127.0.0.1:9"))
+    assert isinstance(msg, str) and "못 붙었어요" in msg, msg
+    # 기본 모델은 여기가 단일 출처다 (commands·agent가 이 값을 가져다 쓴다)
+    assert set(DEFAULT_MODEL) == {"anthropic", "openai"}  # vllm은 서버가 모델을 정한다
+    assert all(isinstance(v, str) and v for v in DEFAULT_MODEL.values())
     print("selftest OK")
 
 

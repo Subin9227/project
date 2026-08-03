@@ -15,6 +15,7 @@ agent.py가 만든 에이전트에게 넘긴다.
 from __future__ import annotations
 
 import asyncio
+import traceback
 from datetime import datetime, timedelta
 
 import discord
@@ -33,7 +34,7 @@ from secretary.alarms import (
 )
 from secretary.commands import setup_commands
 from secretary.config import DISCORD_BOT_TOKEN, KST, MEMORY_DB_PATH, OWNER_ID
-from secretary.webserver import build_health_server
+from secretary.webserver import attach_client, build_health_server
 
 # 디스코드 한 메시지의 최대 길이. 초과분은 잘라서 보낸다.
 DISCORD_MAX_LEN = 2000
@@ -201,7 +202,8 @@ async def main() -> None:
 
             if not users.enabled():
                 print("   등록 기능: 꺼짐 (.env에 CRED_KEY 없음)")
-            print(f"   등록된 사용자: {len(users.all_users()) if users.enabled() else 0}명")
+            count = len(users.all_users()) if users.enabled() else 0
+            print(f"   등록된 사용자: {count}명  (자세히는 /users)")
 
             # 알림은 로그인 뒤에 켠다 (DM을 보내려면 게이트웨이가 붙어 있어야 한다).
             # on_ready는 재접속 때도 불리므로 이미 돌고 있으면 다시 켜지 않는다.
@@ -294,7 +296,20 @@ async def main() -> None:
                     "아가씨, 처리가 너무 오래 걸려 중단했어요. 잠시 후 다시 시도해 주세요."
                 )
             except Exception as e:  # noqa: BLE001 - 무엇이 터지든 봇은 살아남아 다음 메시지를 받아야 함
-                reply_text = f"처리 중 문제가 생겼어요, 아가씨. ({type(e).__name__})"
+                # 키가 틀린 건 사용자가 고칠 수 있는 문제다. 예외 이름만 보여주면
+                # (AuthenticationError) 뭘 해야 할지 알 수 없다.
+                name = type(e).__name__
+                if "Authentication" in name or "PermissionDenied" in name:
+                    reply_text = (
+                        "아가씨, 등록하신 API 키가 거부됐어요. "
+                        "`/register`로 키를 다시 넣어 주시겠어요?"
+                    )
+                elif "RateLimit" in name:
+                    reply_text = (
+                        "아가씨의 API 사용량 한도에 걸렸어요. 잠시 뒤에 다시 불러주세요."
+                    )
+                else:
+                    reply_text = f"처리 중 문제가 생겼어요, 아가씨. ({name})"
             finally:
                 # 심어둔 주인을 반드시 걷어낸다. 안 걷으면 이 Task가 재사용될 때
                 # 남의 설정이 남아 있을 수 있다.
@@ -305,7 +320,28 @@ async def main() -> None:
         # 봇(디스코드 게이트웨이)과 상태 서버(/health)를 같은 asyncio 루프에서
         # 나란히 실행한다. 한 프로세스 안에서 둘 다 돌아가므로 Phase 2 관측
         # 스크립트를 그대로 재사용할 수 있다. 둘 중 하나라도 끝나면 gather가 반환된다.
+        @client.event
+        async def on_guild_join(guild: discord.Guild):
+            """새 서버에 초대되면 주인에게 알린다.
+
+            로컬이든 EC2든 봇은 하나뿐이라, 누가 데려갔는지 모르면 사용량을 가늠할 수
+            없다. 초대 순간이 유일하게 확실한 신호다.
+            """
+            print(f"[초대] {guild.name} (총 {len(client.guilds)}개 서버)")
+            if not OWNER_ID:
+                return
+            try:
+                owner = await client.fetch_user(int(OWNER_ID))
+                await owner.send(
+                    f"🎀 '{guild.name}' 서버에 초대됐어요. "
+                    f"지금 총 {len(client.guilds)}개 서버 / "
+                    f"등록 {len(users.all_users()) if users.enabled() else 0}명이에요."
+                )
+            except Exception:  # noqa: BLE001 - 알림 실패로 봇이 죽으면 안 된다
+                traceback.print_exc()
+
         health_server = build_health_server()
+        attach_client(client)  # /health가 서버 수를 셀 수 있게
         await asyncio.gather(
             client.start(DISCORD_BOT_TOKEN),
             health_server.serve(),

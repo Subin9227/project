@@ -33,7 +33,8 @@ PROVIDERS = [
     app_commands.Choice(name="직접 띄운 vLLM 서버", value="vllm"),
 ]
 
-_DEFAULT_MODEL = {"anthropic": "claude-sonnet-4-5", "openai": "gpt-4o-mini"}
+# 기본 모델은 onboarding이 단일 출처다 (검증할 때와 저장할 때가 달라지면 안 된다).
+_DEFAULT_MODEL = onboarding.DEFAULT_MODEL
 
 
 class RegisterModal(discord.ui.Modal):
@@ -84,13 +85,21 @@ class RegisterModal(discord.ui.Modal):
         uid = str(interaction.user.id)
         report: list[str] = []
 
-        fields: dict[str, str | None] = {"llm_provider": self.provider}
-        if self.provider == "vllm":
-            fields["vllm_base_url"] = self.llm.value.strip()
+        # 뇌 — 여기서 실제로 한 번 불러본다. 안 하면 'hello' 같은 값도 그대로 저장되고,
+        # 대화할 때가 되어서야 AuthenticationError가 뜬다.
+        secret = self.llm.value.strip()
+        llm_error = await onboarding.verify_llm(self.provider, secret)
+        fields: dict[str, str | None] = {}
+        if llm_error:
+            report.append(f"❌ 뇌({self.provider}): {llm_error}")
         else:
-            fields["llm_key"] = self.llm.value.strip()
-            fields["llm_model"] = _DEFAULT_MODEL[self.provider]
-        report.append(f"✅ 뇌: {self.provider}")
+            fields["llm_provider"] = self.provider
+            if self.provider == "vllm":
+                fields["vllm_base_url"] = secret
+            else:
+                fields["llm_key"] = secret
+                fields["llm_model"] = _DEFAULT_MODEL[self.provider]
+            report.append(f"✅ 뇌: {self.provider}")
 
         # 노션 — 페이지 하나에서 DB들을 찾아낸다
         token = self.notion_token.value.strip()
@@ -164,8 +173,9 @@ def setup_commands(tree: app_commands.CommandTree) -> None:
             return
         await interaction.response.send_modal(RegisterModal(provider.value))
 
-    @tree.command(name="setup", description="알림을 언제 어디로 받을지 정해요")
+    @tree.command(name="setup", description="알림 시각과 쓸 모델을 정해요")
     @app_commands.describe(
+        model="쓸 모델 이름 (예: gpt-4o, claude-sonnet-4-5). 제공자는 /register에서 정해요",
         target="알림 받을 곳의 ID (채널이든 나든). 비우면 이 채널",
         work_start="업무 시작 알림 시각 (예: 09:00)",
         work_end="업무 종료 알림 시각 (예: 18:00)",
@@ -174,6 +184,7 @@ def setup_commands(tree: app_commands.CommandTree) -> None:
     )
     async def setup(
         interaction: discord.Interaction,
+        model: str | None = None,
         target: str | None = None,
         work_start: str | None = None,
         work_end: str | None = None,
@@ -181,17 +192,29 @@ def setup_commands(tree: app_commands.CommandTree) -> None:
         mention: str | None = None,
     ):
         uid = str(interaction.user.id)
-        if users.get(uid) is None:
+        me = users.get(uid)
+        if me is None:
             await interaction.response.send_message(
                 "먼저 `/register`로 연결해 주세요.", ephemeral=True
             )
             return
+
+        # 모델을 바꾸면 실제로 한 번 불러본다(3초를 넘길 수 있어 응답을 미룬다).
+        # ⚠️ 확인 안 하면 오타를 냈을 때 대화 도중에야 NotFoundError가 뜬다.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if model:
+            secret = me.vllm_base_url if me.llm_provider == "vllm" else me.llm_key
+            error = await onboarding.verify_llm(me.llm_provider, secret, model.strip())
+            if error:
+                await interaction.followup.send(f"❌ {error}", ephemeral=True)
+                return
 
         fields = {
             "alarm_target": target or str(interaction.channel_id),
             "alarm_mention": mention or uid,
         }
         for key, value in (
+            ("llm_model", model),
             ("work_start", work_start),
             ("work_end", work_end),
             ("weekly_at", weekly),
@@ -201,8 +224,9 @@ def setup_commands(tree: app_commands.CommandTree) -> None:
 
         users.save(uid, **fields)
         u = users.get(uid)
-        await interaction.response.send_message(
-            "✅ 알림 설정을 저장했어요.\n"
+        await interaction.followup.send(
+            "✅ 설정을 저장했어요.\n"
+            f"  뇌: {u.llm_provider} / {u.llm_model or '(기본값)'}\n"
             f"  받을 곳: {u.alarm_target}\n"
             f"  업무: {u.work_start or '(안 함)'} ~ {u.work_end or '(안 함)'}\n"
             f"  주간: {u.weekly_at or '(안 함)'}",
@@ -233,6 +257,50 @@ def setup_commands(tree: app_commands.CommandTree) -> None:
             ),
             ephemeral=True,
         )
+
+    @tree.command(name="users", description="(주인 전용) 누가 등록했고 연결은 됐는지")
+    # 목록에서 가리는 용도. 서버 관리자에게는 보이지만 **실행은 아래 OWNER_ID 검사가
+    # 막는다** — 남의 서버 관리자가 눌러도 거부된다.
+    @app_commands.default_permissions(administrator=True)
+    async def user_list(interaction: discord.Interaction):
+        """운영용. 누가 막혀 있는지 알아야 도와줄 수 있다.
+
+        ⚠️ 값은 절대 안 보여준다 — 연결 여부(✅/➖)만. 남의 노션 토큰이나
+           블레이버스 비밀번호는 주인도 볼 이유가 없다.
+        """
+        if not OWNER_ID or str(interaction.user.id) != OWNER_ID:
+            await interaction.response.send_message(
+                "이건 주인만 쓸 수 있어요, 아가씨.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        rows = users.all_users()
+        if not rows:
+            await interaction.followup.send("아직 등록한 사람이 없어요.", ephemeral=True)
+            return
+
+        lines = [f"등록 {len(rows)}명"]
+        for u in rows[:20]:  # 디스코드 2000자 한도. 넘으면 잘라 보여준다
+            try:
+                who = str(await interaction.client.fetch_user(int(u.discord_id)))
+            except Exception:  # noqa: BLE001 - 탈퇴했거나 못 찾는 경우
+                who = f"(ID {u.discord_id})"
+            brain = u.llm_provider or "없음"
+            if not u.registered:
+                brain += " ⚠️미완"
+            lines.append(
+                f"• {who}\n"
+                f"    뇌 {brain} / 노션 {'✅' if u.notion_token else '➖'}"
+                f"(루틴 {'✅' if u.routine_ds_id else '➖'}"
+                f" 과제 {'✅' if u.homework_ds_id else '➖'})"
+                f" / 블레이버스 {'✅' if u.blaybus_id else '➖'}"
+                f" / 알림 {'✅' if u.alarm_target else '➖'}"
+                f" / 오늘 {u.daily_count if u.count_date else 0}건"
+            )
+        if len(rows) > 20:
+            lines.append(f"… 외 {len(rows) - 20}명")
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
 
     @tree.command(name="forget", description="저장된 내 정보를 전부 지워요")
     async def forget(interaction: discord.Interaction):

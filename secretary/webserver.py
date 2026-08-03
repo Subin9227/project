@@ -17,19 +17,37 @@ from __future__ import annotations
 import uvicorn
 from fastapi import FastAPI
 
+from secretary import users
 from secretary.config import HEALTH_HOST, HEALTH_PORT
 
 # FastAPI 앱. /docs(자동 문서)도 함께 열려, 브라우저로 http://IP:8000/docs 확인 가능.
 app = FastAPI(title="공주비서 상태 서버")
 
+# 봇 클라이언트를 여기에 걸어두면 /health가 서버 수를 셀 수 있다.
+# (webserver가 bot을 import하면 순환이라, bot이 자기를 넘겨주는 방향으로 만든다)
+_client = None
+
+
+def attach_client(client) -> None:
+    global _client
+    _client = client
+
 
 @app.get("/health")
 async def health() -> dict:
-    """살아있는지 확인용. 평문 JSON을 돌려준다 → WireShark에서 그대로 읽힌다.
+    """살아있는지 + 몇 명이 쓰는지. 평문 JSON이라 폰 브라우저로도 바로 보인다.
 
-    나중에 Phase 5(EC2)·6(CI/CD)에서 배포 성공 판정에도 이 엔드포인트를 재사용한다.
+    ⚠️ 이 문에는 인증이 없다. 그래서 **개수만** 낸다 — 서버 이름이나 사용자 ID는
+       넣지 않는다.
     """
-    return {"status": "ok", "service": "공주비서"}
+    body = {"status": "ok", "service": "공주비서"}
+    if _client is not None:
+        body["guilds"] = len(_client.guilds)  # 초대된 서버 수
+    try:
+        body["users"] = len(users.all_users()) if users.enabled() else 0
+    except Exception:  # noqa: BLE001 - 통계 때문에 헬스체크가 실패하면 안 된다
+        body["users"] = None
+    return body
 
 
 def build_health_server() -> uvicorn.Server:

@@ -29,6 +29,7 @@ from secretary.config import (
 )
 from secretary.homework_tools import HOMEWORK_TOOLS
 from secretary.notion_tools import ROUTINE_TOOLS
+from secretary.onboarding import DEFAULT_MODEL
 from secretary.persona import SYSTEM_PROMPT
 
 _WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
@@ -98,7 +99,7 @@ def _build_model(user):
 
     if user.llm_provider == "openai":
         return ChatOpenAI(
-            model=user.llm_model or "gpt-4o-mini",
+            model=user.llm_model or DEFAULT_MODEL["openai"],
             api_key=user.llm_key,
             max_tokens=MAX_TOKENS,
         )

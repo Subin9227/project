@@ -148,6 +148,32 @@ class RegisterModal(discord.ui.Modal):
         await interaction.followup.send("\n".join(report), ephemeral=True)
 
 
+# /setup의 target 인자를 해석할 낱말. 채널 ID를 외우고 있는 사람은 없다.
+_HERE = {"여기", "이채널", "here", "this"}
+_OFF = {"끄기", "꺼", "안받기", "없음", "off", "none"}
+
+
+def parse_alarm_target(
+    value: str | None, channel_id: int | str
+) -> tuple[bool, str | None]:
+    """(설정을 바꿀까, 바꾼다면 어떤 값으로).
+
+    ⚠️ 값을 안 주면 **아무것도 안 바꾼다.** 예전엔 현재 채널로 조용히 채워서,
+       시간만 고치려고 /setup을 부른 사람의 채널이 전부 알림 대상이 됐다
+       (2026-08-04: 등록 6명에 알림 스케줄 4개). 같은 함수의 다른 칸들은
+       처음부터 '준 것만 갱신'이었는데 이 칸만 예외였다.
+    """
+    text = (value or "").strip()
+    if not text:  # 공백만 준 것도 '안 준 것'으로 본다
+        return False, None
+    low = text.lower()
+    if low in _OFF:
+        return True, None
+    if low in _HERE:
+        return True, str(channel_id)
+    return True, text
+
+
 def _mask(value: str | None) -> str:
     """비밀은 앞 4자만 보여준다. 화면 공유·캡처로 새는 걸 막는다."""
     if not value:
@@ -176,7 +202,7 @@ def setup_commands(tree: app_commands.CommandTree) -> None:
     @tree.command(name="setup", description="알림 시각과 쓸 모델을 정해요")
     @app_commands.describe(
         model="쓸 모델 이름 (예: gpt-4o, claude-sonnet-4-5). 제공자는 /register에서 정해요",
-        target="알림 받을 곳의 ID (채널이든 나든). 비우면 이 채널",
+        target="알림 받을 곳: '여기'(이 채널) / '끄기' / 채널·사람 ID. 비우면 그대로 둬요",
         work_start="업무 시작 알림 시각 (예: 09:00)",
         work_end="업무 종료 알림 시각 (예: 18:00)",
         weekly="주간 브리핑 (예: MON 08:00)",
@@ -209,10 +235,16 @@ def setup_commands(tree: app_commands.CommandTree) -> None:
                 await interaction.followup.send(f"❌ {error}", ephemeral=True)
                 return
 
-        fields = {
-            "alarm_target": target or str(interaction.channel_id),
-            "alarm_mention": mention or uid,
-        }
+        fields: dict[str, str | None] = {}
+        change_target, new_target = parse_alarm_target(target, interaction.channel_id)
+        if change_target:
+            fields["alarm_target"] = new_target
+            # 끄면 멘션도 함께 지운다. 보낼 곳이 없는데 남겨두면 다음에 켤 때
+            # 예전 멘션이 되살아난다.
+            fields["alarm_mention"] = (mention or uid) if new_target else None
+        elif mention:
+            fields["alarm_mention"] = mention.strip()
+
         for key, value in (
             ("llm_model", model),
             ("work_start", work_start),
@@ -227,7 +259,7 @@ def setup_commands(tree: app_commands.CommandTree) -> None:
         await interaction.followup.send(
             "✅ 설정을 저장했어요.\n"
             f"  뇌: {u.llm_provider} / {u.llm_model or '(기본값)'}\n"
-            f"  받을 곳: {u.alarm_target}\n"
+            f"  알림 받을 곳: {u.alarm_target or '(안 받음)'}\n"
             f"  업무: {u.work_start or '(안 함)'} ~ {u.work_end or '(안 함)'}\n"
             f"  주간: {u.weekly_at or '(안 함)'}",
             ephemeral=True,
@@ -250,8 +282,10 @@ def setup_commands(tree: app_commands.CommandTree) -> None:
                     f"  과제 DB: {u.homework_ds_id or '없음'}",
                     f"블레이버스: {u.blaybus_id or '없음'}"
                     f" / 비번 {_mask(u.blaybus_pw)} / 프로젝트 {u.blaybus_pid or '-'}",
-                    f"알림: {u.alarm_target or '없음'}"
-                    f" ({u.work_start or '-'}~{u.work_end or '-'}, 주간 {u.weekly_at or '-'})",
+                    f"알림: {u.alarm_target or '안 받음'}"
+                    f" ({u.work_start or '-'}~{u.work_end or '-'}, 주간 {u.weekly_at or '-'})"
+                    # 예전 /setup이 채널을 조용히 등록해서, 받는 줄 모르는 사람이 있다
+                    + (" — 끄려면 `/setup target:끄기`" if u.alarm_target else ""),
                     f"오늘 쓴 메시지: {u.daily_count if u.count_date else 0}",
                 ]
             ),
@@ -323,6 +357,21 @@ def _selftest() -> None:
     assert len(PROVIDERS) == 3
     # 고지 문장이 비어 있으면 안 된다 — 이게 이 단계의 산출물이다
     assert "비밀번호" in WARNING and "/forget" in WARNING
+
+    # /setup의 target 해석. 여기가 알림 대상이 멋대로 늘어나던 자리다.
+    # 값을 안 주면 건드리지 않는다 (예전엔 현재 채널로 조용히 채웠다)
+    assert parse_alarm_target(None, 111) == (False, None)
+    assert parse_alarm_target("", 111) == (False, None)
+    assert parse_alarm_target("   ", 111) == (False, None)  # 공백만도 '안 준 것'
+    # 끄기
+    for word in ("끄기", "off", "OFF", "없음", " 안받기 "):
+        assert parse_alarm_target(word, 111) == (True, None), word
+    # 이 채널
+    for word in ("여기", "here", "HERE", " 이채널 "):
+        assert parse_alarm_target(word, 111) == (True, "111"), word
+    # 그 밖엔 준 값 그대로 (채널이든 사람이든 ID)
+    assert parse_alarm_target(" 1533725805023203369 ", 111) == (True, "1533725805023203369")
+    assert isinstance(parse_alarm_target("여기", 111), tuple)
     print("selftest OK")
 
 

@@ -314,6 +314,46 @@ async def _locate_section(
     return None, None
 
 
+async def _section_blocks(
+    client: httpx.AsyncClient, page_id: str, heading_id: str
+) -> list[dict]:
+    """그 칸(헤딩) 아래에 실제로 붙어 있는 블록들. 다음 헤딩을 만나면 멈춘다.
+
+    노션은 헤딩 아래 내용을 '자식'으로 담지 않는다 — 전부 페이지의 형제 블록이고,
+    다음 헤딩이 나올 때까지가 그 칸의 몫이다. 그래서 순서대로 훑어야 한다.
+    """
+    out: list[dict] = []
+    collecting = False
+    for block in await _blocks_of(client, page_id):
+        if block["id"] == heading_id:
+            collecting = True
+            continue
+        if not collecting:
+            continue
+        if block.get("type") in _HEADINGS:
+            break
+        out.append(block)
+    return out
+
+
+def _append_anchor(section: list[dict], heading_id: str) -> str:
+    """덧붙일 때 어느 블록 뒤에 넣을지. 칸의 마지막 블록, 비었으면 헤딩.
+
+    ⚠️ 항상 헤딩 뒤에 넣으면 새 글이 매번 맨 위에 꽂혀서, 회고를 위에서 아래로
+       읽을 때 시간이 거꾸로 흐른다 (2026-08-04 실사용자 화면에서 확인).
+    """
+    return section[-1]["id"] if section else heading_id
+
+
+def _paragraph_text(block: dict) -> str | None:
+    """문단 블록이면 그 글자를, 아니면 None (사진·구분선 등)."""
+    if block.get("type") != "paragraph":
+        return None
+    return "".join(
+        rt.get("plain_text", "") for rt in block["paragraph"].get("rich_text", [])
+    )
+
+
 def _compress_image(data: bytes) -> tuple[bytes, str, str]:
     """5MB 초과 이미지를 JPEG로 압축/축소한다. (bytes, filename, content_type) 반환."""
     img = Image.open(io.BytesIO(data))
@@ -557,7 +597,11 @@ async def routine_check(item: str, checked: bool = True, date: str = "today") ->
 
 @tool
 async def routine_write(
-    section: str, text: str, date: str = "today", check: bool = True
+    section: str,
+    text: str,
+    date: str = "today",
+    check: bool = True,
+    mode: str = "append",
 ) -> str:
     """데일리루틴 행의 특정 칸(헤딩) 아래에 글을 적고, 그 항목 체크박스를 켠다.
 
@@ -567,19 +611,32 @@ async def routine_write(
 
     회고 아래 어느 칸을 채우든 '회고' 체크박스가 켜진다 (한 칸만 채워도 켜진다).
 
+    ⚠️ **이미 적혀 있던 내용을 결과로 함께 알려준다.** 아가씨께 답할 때 그걸 보고
+    "이미 이렇게 적혀 있는데 더할까요, 갈아 끼울까요?"처럼 안내해라.
+    같은 내용을 이미 적었는지 지레짐작하지 말 것 — 이 도구가 알려준다.
+
     Args:
         section: 글을 넣을 칸(헤딩) 이름.
         text: 넣을 내용. 줄바꿈이 있으면 문단이 나뉜다.
         date: 대상 날짜 YYYY-MM-DD. 기본 'today' = 오늘.
         check: True면 그 칸이 속한 항목 체크박스를 켠다. 아가씨가 "체크는 하지 마"
             라고 할 때만 False.
+        mode: 'append'(기본)는 뒤에 덧붙이되 **이미 똑같이 적힌 줄은 건너뛴다**.
+            'replace'는 그 칸의 기존 문단을 지우고 새로 쓴다 — 블레이버스 시간처럼
+            **값이 갱신되는 내용을 다시 적을 때** 쓴다(덧붙이면 옛 숫자가 같이 남는다).
+            ⚠️ replace는 아가씨가 노션에서 손으로 쓰신 글도 지운다. 갱신이 확실할
+            때만 쓰고, 애매하면 append로 두고 여쭤라. (사진은 지우지 않는다)
 
     Returns:
-        처리 결과 문자열.
+        처리 결과 문자열. 원래 적혀 있던 내용이 있으면 함께 돌려준다.
     """
     body = text.strip()
     if not body:
         return "적을 내용이 비어 있어요, 아가씨."
+
+    mode = (mode or "append").strip().lower()
+    if mode not in ("append", "replace"):
+        return f"mode는 'append'나 'replace'여야 해요 (받은 값: '{mode}')."
 
     day = _day_or_today(date)
     try:
@@ -590,17 +647,52 @@ async def routine_write(
                 found = ", ".join(await _list_headings(client, row_id)) or "(하나도 없어요)"
                 return f"'{section}' 칸을 못 찾았어요. 있는 칸: {found}"
 
-            paragraphs = [
-                {"type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": ln}}]}}
-                for ln in body.splitlines()
-                if ln.strip()
-            ]
-            resp = await client.patch(
-                f"{NOTION_API_BASE}/blocks/{row_id}/children",
-                headers=_headers(),
-                json={"after": heading_id, "children": paragraphs},
-            )
-            resp.raise_for_status()
+            # ⚠️ 예전엔 기존 내용을 보지도 않고 헤딩 뒤에 무조건 끼워 넣었다. 그래서
+            #    블레이버스 시간을 두 번 적으면 옛 숫자와 새 숫자가 나란히 쌓였다.
+            #    (2026-08-04 실사용자 제보: "노션 수정할때 자꾸 추가만 해줘요")
+            before = await _section_blocks(client, row_id, heading_id)
+            existing = [t for t in map(_paragraph_text, before) if t and t.strip()]
+
+            lines = [ln for ln in body.splitlines() if ln.strip()]
+            removed = skipped = 0
+            # 새 글을 어느 블록 뒤에 끼울지. 헤딩 뒤에 넣으면 항상 맨 위에 꽂혀서
+            # 덧붙일수록 시간이 거꾸로 흐른다(2026-08-04 실사용자 화면에서 확인).
+            # 덧붙이기는 칸의 끝에, 갈아치우기는 칸의 앞에(템플릿의 '글 다음 사진' 순서 유지).
+            anchor = heading_id
+            if mode == "append":
+                anchor = _append_anchor(before, heading_id)
+                have = {_norm(t) for t in existing}
+                kept = [ln for ln in lines if _norm(ln) not in have]
+                skipped = len(lines) - len(kept)
+                lines = kept
+            else:  # replace — 글이 든 문단만 지운다.
+                # ⚠️ 사진(attach_routine_photo가 넣은 image)과 템플릿이 칸 끝에 두는
+                #    빈 문단은 건드리지 않는다. 지우면 인증 사진이 날아가고 칸 모양이
+                #    무너지는데, 둘 다 아가씨가 손으로 되돌려야 하는 종류다.
+                for block in before:
+                    if not (_paragraph_text(block) or "").strip():
+                        continue
+                    gone = await client.delete(
+                        f"{NOTION_API_BASE}/blocks/{block['id']}",
+                        headers=_headers(json=False),
+                    )
+                    gone.raise_for_status()
+                    removed += 1
+
+            if lines:
+                paragraphs = [
+                    {
+                        "type": "paragraph",
+                        "paragraph": {"rich_text": [{"text": {"content": ln}}]},
+                    }
+                    for ln in lines
+                ]
+                resp = await client.patch(
+                    f"{NOTION_API_BASE}/blocks/{row_id}/children",
+                    headers=_headers(),
+                    json={"after": anchor, "children": paragraphs},
+                )
+                resp.raise_for_status()
 
             # 글을 쓴 칸이 속한 항목의 체크박스를 켠다.
             # ('셀프 회고: 칭찬'에 쓰면 '회고'가 켜진다 — 소속은 _locate_section이 찾는다)
@@ -616,9 +708,26 @@ async def routine_write(
                     chk.raise_for_status()
                     checked = prop
 
+        # 무엇을 했는지 + **원래 뭐가 있었는지**를 함께 돌려준다.
+        # 뒤엣것이 핵심이다: 칸 내용을 읽는 도구가 따로 없어서, 이걸 안 주면 모델이
+        # "지금 비어 있어요" 같은 말을 지어낸다 (2026-08-04 실제로 그랬다).
+        if mode == "replace":
+            head = f"{day} '{section}'을 새로 썼어요 ({len(lines)}줄, 이전 {removed}줄은 지웠어요)."
+        elif not lines:
+            head = f"{day} '{section}'에 넣을 게 없었어요 — {skipped}줄 모두 이미 똑같이 적혀 있어요."
+        elif skipped:
+            head = f"{day} '{section}'에 {len(lines)}줄 덧붙였어요 (이미 있던 {skipped}줄은 건너뜀)."
+        else:
+            head = f"{day} '{section}'에 {len(lines)}줄 덧붙였어요."
         if checked:
-            return f"{day} 데일리루틴 '{section}'에 적고 '{checked}' 체크박스를 켰어요."
-        return f"{day} 데일리루틴 '{section}'에 적었어요."
+            head += f" '{checked}' 체크박스도 켰어요."
+
+        if existing:
+            was = "\n".join(existing)
+            if len(was) > 600:  # 모델에 실릴 양을 묶어둔다
+                was = was[:600] + f"\n… (외 {len(existing)}줄 중 일부 생략)"
+            head += f"\n\n[원래 이 칸에 있던 내용]\n{was}"
+        return head
     except httpx.HTTPStatusError as e:
         return f"노션 처리 중 오류 ({e.response.status_code}): {e.response.text[:200]}"
     except Exception as e:  # noqa: BLE001
@@ -627,3 +736,81 @@ async def routine_write(
 
 # agent.py가 가져다 쓰는 도구 목록
 ROUTINE_TOOLS = [routine_today, routine_check, routine_write, attach_routine_photo]
+
+
+def _selftest() -> None:
+    """칸 경계 판정과 중복 제거만 점검한다. 여기가 이 파일의 판단 로직이다.
+
+    네트워크는 타지 않는다 — _blocks_of만 갈아끼운다. 실 노션으로 시험하면
+    남의 행에 쓰레기가 남고, 사진 블록을 지우는 실수는 되돌리기 어렵다.
+    """
+    import asyncio
+
+    def heading(bid, level, text):
+        return {"id": bid, "type": f"heading_{level}", f"heading_{level}": {
+            "rich_text": [{"plain_text": text}]}}
+
+    def para(bid, text):
+        return {"id": bid, "type": "paragraph", "paragraph": {
+            "rich_text": [{"plain_text": text}]}}
+
+    page = [
+        heading("h-회고", 2, "회고"),
+        heading("h-한일", 3, "오늘 한 일"),
+        para("p1", "임베딩 정리"),
+        {"id": "img1", "type": "image", "image": {}},      # 사진 인증
+        para("p2", "검증 데이터 정리"),
+        heading("h-특별", 3, "오늘의 특별한 점"),           # ← 여기서 끊겨야 한다
+        para("p3", "남의 칸 내용"),
+    ]
+
+    global _blocks_of
+    real = _blocks_of
+
+    async def fake(client, block_id):
+        return page
+
+    _blocks_of = fake
+    try:
+        got = asyncio.run(_section_blocks(None, "row", "h-한일"))
+        ids = [b["id"] for b in got]
+        # 다음 헤딩 전까지만. 헤딩 자신도, 다음 칸 내용도 안 들어온다
+        assert ids == ["p1", "img1", "p2"], ids
+        # 마지막 칸은 페이지 끝까지
+        assert [b["id"] for b in asyncio.run(_section_blocks(None, "row", "h-특별"))] == ["p3"]
+        # 없는 헤딩이면 빈 목록 (엉뚱한 걸 지우면 안 된다)
+        assert asyncio.run(_section_blocks(None, "row", "h-없음")) == []
+        assert isinstance(got, list)
+    finally:
+        _blocks_of = real
+
+    # 사진은 문단이 아니다 → replace가 지우면 안 되고, 중복 비교에도 안 낀다
+    assert _paragraph_text(para("x", "글")) == "글"
+    assert _paragraph_text({"id": "i", "type": "image", "image": {}}) is None
+    assert _paragraph_text(heading("h", 2, "회고")) is None
+    assert _paragraph_text(para("y", "")) == ""
+
+    # replace가 실제로 지우는 대상: 글이 든 문단만.
+    # (템플릿이 칸 끝에 두는 빈 문단과 사진은 남아야 한다 — 실 노션에서 확인한 구조)
+    section = [para("p1", "옛 기록"), {"id": "img", "type": "image", "image": {}},
+               para("p2", "   "), para("p3", "합계 5시간")]
+    doomed = [b["id"] for b in section if (_paragraph_text(b) or "").strip()]
+    assert doomed == ["p1", "p3"], doomed
+
+    # 중복 판정은 _norm 기준 — 공백이 달라도 같은 줄로 본다
+    existing = {_norm(t) for t in ["임베딩 정리", "검증 데이터 정리"]}
+    new = ["임베딩정리", "프로젝트 아키텍쳐 분석 정리", "검증 데이터  정리"]
+    kept = [ln for ln in new if _norm(ln) not in existing]
+    assert kept == ["프로젝트 아키텍쳐 분석 정리"], kept
+
+    # 덧붙이기는 칸의 **끝**에 붙는다. 헤딩에 붙이면 최신이 맨 위로 와서
+    # 회고를 위에서 아래로 읽을 때 시간이 거꾸로 흐른다.
+    assert _append_anchor(section, "h-반성") == "p3"
+    assert _append_anchor([], "h-반성") == "h-반성"  # 칸이 비어 있으면 헤딩 뒤
+    assert isinstance(_append_anchor(section, "h-반성"), str)
+
+    print("selftest OK")
+
+
+if __name__ == "__main__":
+    _selftest()

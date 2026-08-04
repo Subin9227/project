@@ -488,18 +488,15 @@ async def blaybus_stop(confirm_split: bool = False) -> str:
                 return context.as_message(e, f"'{s['taskTitle']}' 중지에 실패했어요")
 
             if not confirm_split:
-                n = len(parts)
-                title = s["taskTitle"]
-                # 쪼개지면 태스크 이름이 '오전 (1/2)'처럼 바뀐다. 미리 말해두지 않으면
-                # 나중에 같은 이름이 여럿이라 아가씨가 헷갈리신다.
-                shape = f"'{title} (1/{n})' … '{title} ({n}/{n})'"
+                # ⚠️ 쪼개진 뒤 이름('오전 (1/2)')을 미리 보여줬더니, 모델이 그걸 할 일로
+                #    읽고 그 이름의 태스크를 찾아 시작하려 들었다(2026-08-04 실사용자).
+                #    없으니 새로 만들자고까지 했다 — 이름은 빼고 조각 수만 말한다.
                 return (
-                    f"'{title}' 태스크를 {_duration(s['elapsedSeconds'])} 기록했는데, "
-                    "블레이버스는 태스크당 4시간이 상한이라 나눠서 저장해야 해요. "
-                    f"{_describe_parts(parts)} 이렇게 {n}조각이 되고, "
-                    f"태스크도 {shape}처럼 쪼개져요. "
-                    "그렇게 할까요? (블레이버스엔 삭제가 없어서 한 번 기록되면 "
-                    "아가씨가 웹에서 손으로 고치셔야 해요)"
+                    # _duration은 항상 '분'으로 끝나 받침이 있으므로 '이라'로 고정
+                    f"'{s['taskTitle']}' 태스크가 {_duration(s['elapsedSeconds'])}이라 "
+                    f"블레이버스 상한(4시간)을 넘었어요. {_describe_parts(parts)}, "
+                    f"{len(parts)}조각으로 나눠서 저장해야 해요. 그렇게 할까요? "
+                    "(저장한 뒤엔 웹에서 손으로만 고칠 수 있어요)"
                 )
 
             try:
@@ -1033,7 +1030,9 @@ def _selftest() -> None:
     try:
         # ① 그냥 "멈춰줘" → 저장하지 말고 여쭤야 한다
         msg = asyncio.run(blaybus_stop.ainvoke({}))
-        assert "나눠서 저장" in msg and "(1/2)" in msg and "4시간 0분 + 1시간 2분" in msg, msg
+        assert "나눠서 저장" in msg and "4시간 0분 + 1시간 2분" in msg, msg
+        # 쪼개진 뒤 이름을 흘리면 모델이 그 이름의 태스크를 찾아 시작하려 든다
+        assert "(1/2)" not in msg and "(2/2)" not in msg, msg
         assert all(body is None for _, _, body in sent), "확인 전에 뭔가를 저장했다"
 
         # ② 확인받은 뒤 → 서버가 준 index를 그대로 되돌려준다

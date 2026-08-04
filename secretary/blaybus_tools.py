@@ -17,20 +17,26 @@
 
 아젠다 > 워크 > 태스크 3계층이고, 타이머는 태스크에만 있다.
 
-도구 8개:
+도구 9개:
     blaybus_status()            지금 뭐가 돌고 있나
-    blaybus_start(task_title)   이름으로 태스크를 찾아 시간기록 시작
+    blaybus_start(...)          이름으로 태스크를 찾아 시간기록 시작
     blaybus_stop()              돌고 있는 것을 멈춤 (= 태스크 완료)
     blaybus_list()              아젠다>워크>태스크 트리 보기
     blaybus_add_agenda(...)     아젠다 만들기
     blaybus_add_work(...)       워크 만들기
     blaybus_add_task(...)       태스크 만들기
     blaybus_rename(...)         이름 바꾸기 (3계층 공통)
+    blaybus_today_tasks(...)    그날 잰 시간을 아젠다>워크>태스크>분으로
 
-설계 원칙 2가지 (웹에서 사용자가 직접 고친 것과 어긋나지 않으려면):
+설계 원칙 3가지 (웹에서 사용자가 직접 고친 것과 어긋나지 않으려면):
     1) 트리를 캐시하지 않는다. 도구를 부를 때마다 서버에서 새로 읽는다.
     2) 도구가 id를 인자로 받지 않는다. 이름만 받아 그 자리에서 id로 푼다.
        id를 열어두면 몇 턴 전 대화에 남은 낡은 id를 그대로 쓰게 된다.
+    3) ⚠️ **이름은 유일하지 않다.** 이 프로젝트는 '주차 아젠다 > 요일 워크 >
+       오전/오후 태스크' 구조라 '수요일' 워크가 5개, '오전' 태스크가 11개다.
+       그래서 대상을 찾는 도구는 전부 **경로(agenda_title·work_title)를 받아**
+       범위를 좁힐 수 있어야 한다. 2026-08-04에 이게 없어서, 봇이 특정을 못 하자
+       rename 대신 add_work로 우회해 쓰레기 워크를 만들었다.
 """
 
 from __future__ import annotations
@@ -186,6 +192,55 @@ async def _my_id() -> int:
     return resp.json()["data"]["id"]
 
 
+def _walk(tree: list[dict]) -> list[tuple[dict, dict, dict]]:
+    """(아젠다, 워크, 태스크) 3단 경로를 통째로 편다. 태스크가 없는 워크는 빠진다."""
+    return [
+        (a, w, t)
+        for a in tree
+        for w in (a.get("works") or [])
+        for t in (w.get("tasks") or [])
+    ]
+
+
+def _narrow(tree: list[dict], agenda_title: str | None) -> tuple[list[dict], str | None]:
+    """아젠다 이름으로 트리를 좁힌다. 이름을 안 주면 통째로.
+
+    ⚠️ 이 함수가 있는 이유: 이 프로젝트는 '주차 아젠다 > 요일 워크 > 오전/오후 태스크'
+       구조라 **이름이 유일하지 않다**('수요일' 워크 5개, '오전' 태스크 11개).
+       아젠다로 먼저 좁히지 않으면 어느 것을 말하는지 영영 특정할 수 없다.
+    """
+    if not agenda_title:
+        return tree, None
+    picked, err = _resolve(tree, agenda_title, "아젠다")
+    if err:
+        return [], err
+    return [picked], None
+
+
+def _describe(agenda: dict, work: dict | None = None) -> str:
+    """되물을 때 쓸 경로 표기. '13주차 > 수요일'"""
+    return f"{agenda['title']} > {work['title']}" if work else agenda["title"]
+
+
+def _path_of(tree: list[dict], kind: str, item: dict) -> str:
+    """트리에서 그 항목이 어디 붙어 있는지 찾아 경로 문자열로.
+
+    되물을 때 "워크 '수요일', 워크 '수요일', …"이라고만 하면 고를 수가 없다.
+    '13주차 > 수요일'까지 보여줘야 사용자가 답할 수 있다.
+    """
+    if kind == "agenda":
+        return item["title"]
+    for agenda in tree:
+        for work in agenda.get("works") or []:
+            if kind == "work" and work["id"] == item["id"]:
+                return _describe(agenda, work)
+            if kind == "task":
+                for task in work.get("tasks") or []:
+                    if task["id"] == item["id"]:
+                        return f"{_describe(agenda, work)} > {task['title']}"
+    return item["title"]  # 못 찾으면 이름만 (있을 수 없지만 방어)
+
+
 def _flatten(tree: list[dict]) -> list[tuple[str, dict]]:
     """트리를 (계층, 항목) 한 줄짜리 목록으로 편다."""
     out: list[tuple[str, dict]] = []
@@ -248,39 +303,79 @@ async def blaybus_status() -> str:
 
 
 @tool
-async def blaybus_start(task_title: str) -> str:
+async def blaybus_start(
+    task_title: str,
+    work_title: str | None = None,
+    agenda_title: str | None = None,
+) -> str:
     """블레이버스에서 태스크 이름으로 시간기록을 시작한다.
 
-    "블레이버스 오후 시작해줘", "화요일 오전 켜줘" 같은 요청에 쓴다.
-    이름이 애매하면 후보를 돌려주니, 사용자에게 어느 것인지 되물어라.
+    "13주차 수요일 오전 시작해줘" 처럼 쓴다.
+
+    ⚠️ 태스크 이름은 유일하지 않다 — '오전'만 열 개가 넘는다. 여럿이라고 답이 오면
+    **work_title·agenda_title을 채워 다시 불러라.**
 
     Args:
-        task_title: 시작할 태스크 제목. 워크나 아젠다 이름이 아니라 태스크 이름이다.
+        task_title: 시작할 태스크 제목 (예: '오전'). 워크·아젠다 이름이 아니다.
+        work_title: 그 태스크가 속한 워크 (예: '수요일').
+        agenda_title: 그 워크가 속한 아젠다 (예: '13주차').
 
     Returns:
         처리 결과 문자열.
     """
     try:
-        resp = await _request("GET", f"/project/{_project_id()}/task")
-        resp.raise_for_status()
-        tasks = resp.json()["data"]["list"]
+        tree = await _tree()
     except Exception as e:  # noqa: BLE001
         return context.as_message(e, "블레이버스 태스크 목록을 못 봤어요")
 
-    picked = _pick_task(tasks, task_title)
-    if isinstance(picked, list):
-        if not picked:
-            titles = ", ".join(f"'{t['title']}'" for t in tasks[:10])
-            return f"'{task_title}' 태스크를 못 찾았어요. 있는 것: {titles}"
-        titles = ", ".join(f"'{t['title']}'" for t in picked)
-        return f"'{task_title}'에 해당하는 게 여럿이에요: {titles}. 어느 걸로 할까요?"
+    tree, err = _narrow(tree, agenda_title)
+    if err:
+        return err
 
+    # 트리를 쓰는 이유: /project/{pid}/task는 평평한 목록이라 소속을 알 수 없다.
+    # 되물을 때 '13주차 > 수요일'을 보여주려면 경로가 있어야 한다.
+    triples = _walk(tree)
+    if work_title:
+        want = _norm(work_title)
+        narrowed = [x for x in triples if _norm(x[1]["title"]) == want]
+        triples = narrowed or [x for x in triples if want in _norm(x[1]["title"])]
+
+    want = _norm(task_title)
+    hits = [x for x in triples if _norm(x[2]["title"]) == want]
+    if not hits:
+        hits = [x for x in triples if want in _norm(x[2]["title"])]
+
+    if not hits:
+        names = ", ".join(f"'{_describe(a, w)} > {t['title']}'" for a, w, t in triples[:8])
+        return f"'{task_title}' 태스크를 못 찾았어요. 있는 것: {names or '(없어요)'}"
+
+    # ⚠️ 끝난 태스크는 시작 후보가 아니다. 같은 워크 안에 같은 이름이 여러 개
+    #    있는 게 정상이라('수요일'에 '오전' 3개), 이걸 안 거르면 경로를 다 줘도
+    #    특정이 안 된다. 블레이버스도 이어하기는 재시작이 아니라 복제로 한다
+    #    (이용 가이드 p.29 — 태스크당 최대 4시간).
+    running = [x for x in hits if not x[2].get("completedDate")]
+    if not running:
+        where = ", ".join(f"'{_describe(a, w)}'" for a, w, _ in hits[:5])
+        return (
+            f"'{task_title}'는 이미 다 끝난 것뿐이에요 ({where}). "
+            "새로 만들어서 시작할까요?"
+        )
+    hits = running
+
+    if len(hits) > 1:
+        names = ", ".join(f"'{_describe(a, w)} > {t['title']}'" for a, w, t in hits[:10])
+        return (
+            f"'{task_title}'에 해당하는 게 여럿이에요: {names}. "
+            "어느 아젠다·워크 것인지 알려주시면 그걸 시작할게요."
+        )
+
+    agenda, work, task = hits[0]
     try:
-        resp = await _request("POST", f"/task/{picked['id']}/session/start")
+        resp = await _request("POST", f"/task/{task['id']}/session/start")
         resp.raise_for_status()
     except Exception as e:  # noqa: BLE001
-        return context.as_message(e, "'{picked['title']}' 시작에 실패했어요")
-    return f"블레이버스에서 '{picked['title']}' 시간기록을 시작했어요."
+        return context.as_message(e, f"'{task['title']}' 시작에 실패했어요")
+    return f"'{_describe(agenda, work)} > {task['title']}' 시간기록을 시작했어요."
 
 
 @tool
@@ -417,16 +512,24 @@ async def blaybus_add_work(work_title: str, agenda_title: str, date: str | None 
 
 
 @tool
-async def blaybus_add_task(task_title: str, work_title: str | None = None) -> str:
+async def blaybus_add_task(
+    task_title: str,
+    work_title: str | None = None,
+    agenda_title: str | None = None,
+) -> str:
     """블레이버스 워크 안에 태스크를 만든다. 태스크는 시간기록(타이머)을 다는 최소 단위다.
 
-    "'로그인 붙이기' 태스크 만들어줘" 처럼 쓴다. 만들기만 하고 시작하지는 않는다
-    (시작은 blaybus_start).
+    "13주차 수요일에 '오전' 태스크 만들어줘" 처럼 쓴다. 만들기만 하고 시작하지는
+    않는다 (시작은 blaybus_start).
+
+    ⚠️ 워크 이름은 유일하지 않다 — '수요일' 워크가 주차마다 있다. 되물으면 사용자가
+    알려준 아젠다를 **agenda_title에 넣어 다시 불러라.** 그래야 특정이 된다.
 
     Args:
         task_title: 만들 태스크 제목.
-        work_title: 이 태스크를 넣을 워크 이름. 생략하면 워크가 하나뿐일 때만 거기에 넣고,
-            여럿이면 어느 워크인지 되묻는다.
+        work_title: 넣을 워크 이름 (예: '수요일').
+        agenda_title: 그 워크가 속한 아젠다 (예: '13주차'). 같은 이름의 워크가
+            여러 아젠다에 있을 때 이걸로 좁힌다.
 
     Returns:
         처리 결과 문자열.
@@ -437,18 +540,29 @@ async def blaybus_add_task(task_title: str, work_title: str | None = None) -> st
     except Exception as e:  # noqa: BLE001
         return context.as_message(e, "블레이버스 정보를 못 봤어요")
 
+    tree, err = _narrow(tree, agenda_title)
+    if err:
+        return err
+
     works = [(a, w) for a in tree for w in (a.get("works") or [])]
     if work_title:
-        picked, err = _resolve([w for _, w in works], work_title, "워크")
-        if err:
-            return err
-        agenda, work = next((a, w) for a, w in works if w["id"] == picked["id"])
+        matched = [(a, w) for a, w in works if _norm(w["title"]) == _norm(work_title)]
+        if not matched:  # 완전일치가 없으면 부분일치까지
+            matched = [(a, w) for a, w in works if _norm(work_title) in _norm(w["title"])]
+        if not matched:
+            names = ", ".join(f"'{_describe(a, w)}'" for a, w in works[:10]) or "(없어요)"
+            return f"'{work_title}' 워크를 못 찾았어요. 있는 것: {names}"
+        if len(matched) > 1:
+            names = ", ".join(f"'{_describe(a, w)}'" for a, w in matched)
+            return (
+                f"'{work_title}' 워크가 여럿이에요: {names}. "
+                "어느 아젠다 것인지 알려주시면 거기에 넣을게요."
+            )
+        agenda, work = matched[0]
     elif len(works) == 1:
         agenda, work = works[0]
     else:
-        # 워크 이름은 프로젝트 안에서 유일하지 않다('금요일'이 여러 아젠다에 있다).
-        # 그래서 소속 아젠다를 같이 보여줘야 사용자가 고를 수 있다.
-        names = ", ".join(f"'{a['title']} > {w['title']}'" for a, w in works[:10]) or "(워크가 없어요)"
+        names = ", ".join(f"'{_describe(a, w)}'" for a, w in works[:10]) or "(워크가 없어요)"
         return f"어느 워크에 넣을까요? 있는 워크: {names}"
 
     try:
@@ -465,21 +579,33 @@ async def blaybus_add_task(task_title: str, work_title: str | None = None) -> st
         )
         resp.raise_for_status()
     except Exception as e:  # noqa: BLE001
-        return context.as_message(e, "태스크 '{task_title}' 생성에 실패했어요")
-    return f"워크 '{work['title']}'에 태스크 '{task_title}'를 만들었어요."
+        return context.as_message(e, f"태스크 '{task_title}' 생성에 실패했어요")
+    return f"'{_describe(agenda, work)}'에 태스크 '{task_title}'를 만들었어요."
 
 
 @tool
-async def blaybus_rename(old_title: str, new_title: str, kind: str | None = None) -> str:
-    """블레이버스 아젠다/워크/태스크의 이름을 바꾼다.
+async def blaybus_rename(
+    old_title: str,
+    new_title: str,
+    kind: str | None = None,
+    agenda_title: str | None = None,
+    work_title: str | None = None,
+) -> str:
+    """블레이버스 아젠다/워크/태스크의 **이름만** 바꾼다. 새로 만들지 않는다.
 
-    "'API연결' 이름 바꿔줘" 처럼 쓴다. 사용자가 계층을 말하지 않아도 되도록
-    kind 없이도 찾지만, 같은 이름이 여러 계층에 있으면 되묻는다.
+    "13주차 수요일 워크를 화요일로 바꿔줘" 처럼 쓴다.
+
+    ⚠️ 이름이 유일하지 않다 — '수요일' 워크가 주차마다 있다. 여럿이라고 답이 오면
+    **agenda_title에 아젠다를 넣어 다시 불러라.** 절대 blaybus_add_work로
+    새로 만들어 우회하지 마라 — 쓰레기 워크가 쌓인다.
 
     Args:
         old_title: 지금 이름.
         new_title: 바꿀 이름.
-        kind: 'agenda' | 'work' | 'task'. 어느 계층인지 확실할 때만 준다.
+        kind: 'agenda' | 'work' | 'task'. 어느 계층인지 확실할 때만.
+        agenda_title: 대상이 속한 아젠다 (예: '13주차'). 같은 이름이 여러 곳에
+            있을 때 이걸로 좁힌다.
+        work_title: 태스크 이름을 바꿀 때, 그 태스크가 속한 워크 (예: '수요일').
 
     Returns:
         처리 결과 문자열.
@@ -488,20 +614,47 @@ async def blaybus_rename(old_title: str, new_title: str, kind: str | None = None
         return f"kind는 agenda, work, task 중 하나여야 해요 (받은 값: '{kind}')."
 
     try:
-        pairs = _flatten(await _tree())
+        tree = await _tree()
     except Exception as e:  # noqa: BLE001
         return context.as_message(e, "블레이버스 목록을 못 봤어요")
 
+    tree, err = _narrow(tree, agenda_title)
+    if err:
+        return err
+
+    pairs = _flatten(tree)
+    # 워크를 지정하면 그 워크와 그 아래 태스크만 남긴다 (아젠다는 범위 밖).
+    if work_title:
+        want = _norm(work_title)
+        pairs = [
+            p
+            for p in pairs
+            if (p[0] == "work" and _norm(p[1]["title"]) == want)
+            or (
+                p[0] == "task"
+                and any(
+                    _norm(w["title"]) == want and p[1] in (w.get("tasks") or [])
+                    for a in tree
+                    for w in (a.get("works") or [])
+                )
+            )
+        ]
     if kind:
         pairs = [p for p in pairs if p[0] == kind]
     hits = _match(pairs, old_title)
 
     if not hits:
         where = f"{_KIND_KR[kind]} 중에" if kind else "블레이버스에"
-        return f"{where} '{old_title}'가 없어요. 이름을 다시 확인해 주세요."
+        scope = f" ('{agenda_title}' 안에서 찾았어요)" if agenda_title else ""
+        return f"{where} '{old_title}'가 없어요{scope}. 이름을 다시 확인해 주세요."
     if len(hits) > 1:
-        names = ", ".join(f"{_KIND_KR[k]} '{i['title']}'" for k, i in hits[:10])
-        return f"'{old_title}'에 해당하는 게 여럿이에요: {names}. 어느 걸로 할까요?"
+        # ⚠️ 이름만 나열하면 "워크 '수요일', 워크 '수요일', …"이 되어 고를 수가 없다.
+        #    어느 아젠다 밑인지 보여야 사용자가 답할 수 있다.
+        names = ", ".join(f"{_KIND_KR[k]} '{_path_of(tree, k, i)}'" for k, i in hits[:10])
+        return (
+            f"'{old_title}'에 해당하는 게 여럿이에요: {names}. "
+            "어느 아젠다 것인지 알려주시면 그것만 바꿀게요."
+        )
 
     found_kind, item = hits[0]
     path = _RENAME_PATHS[found_kind].format(pid=_project_id(), id=item["id"])
@@ -636,6 +789,58 @@ def _selftest() -> None:
     assert isinstance(picked, dict) and picked["id"] == 201 and err is None
     picked, err = _resolve(tree[0]["works"], "없는워크", "워크")
     assert picked is None and isinstance(err, str) and "못 찾았어요" in err
+
+    # --- 이름이 겹치는 실제 구조 ---------------------------------------------
+    # ⚠️ 위 트리는 이름이 전부 유일해서 2026-08-04에 터진 버그를 못 잡았다.
+    #    실제 데이터는 '수요일' 워크 5개, '오전' 태스크 11개다. 그대로 흉내낸다.
+    dup = [
+        {
+            "id": 1, "title": "12주차",
+            "works": [{"id": 10, "title": "수요일",
+                       "tasks": [{"id": 100, "title": "오전"}]}],
+        },
+        {
+            "id": 2, "title": "13주차",
+            "works": [{"id": 20, "title": "수요일",
+                       "tasks": [{"id": 200, "title": "오전"}]}],
+        },
+    ]
+
+    # 아젠다를 안 주면 트리 전체, 주면 그 아젠다만
+    narrowed, err = _narrow(dup, None)
+    assert narrowed == dup and err is None
+    narrowed, err = _narrow(dup, "13주차")
+    assert err is None and len(narrowed) == 1 and narrowed[0]["id"] == 2
+    # 없는 아젠다는 빈 목록 + 안내문 (조용히 전체를 쓰면 남의 주차를 건드린다)
+    narrowed, err = _narrow(dup, "99주차")
+    assert narrowed == [] and isinstance(err, str) and "못 찾았어요" in err
+
+    # 좁히기 전엔 '수요일'이 둘, 좁힌 뒤엔 하나 — 이게 되물음이 풀리는 지점이다
+    def _works_named(t, name):
+        return [w for a in t for w in a["works"] if w["title"] == name]
+
+    assert len(_works_named(dup, "수요일")) == 2
+    assert len(_works_named(_narrow(dup, "13주차")[0], "수요일")) == 1
+
+    # 3단 경로가 태스크마다 온전히 나와야 되물을 때 '13주차 > 수요일 > 오전'을 보여준다
+    triples = _walk(dup)
+    assert len(triples) == 2
+    assert all(len(x) == 3 for x in triples)
+    assert {_describe(a, w) for a, w, _ in triples} == {"12주차 > 수요일", "13주차 > 수요일"}
+    assert _describe(dup[1]) == "13주차"  # 워크 없이 아젠다만
+    assert isinstance(_describe(dup[1], dup[1]["works"][0]), str)
+
+    # 태스크가 없는 워크는 _walk에서 빠진다 (시작할 게 없으니 후보도 아니다)
+    assert _walk([{"id": 3, "title": "빈주차", "works": [{"id": 30, "title": "월", "tasks": []}]}]) == []
+
+    # 되물을 때 경로가 나와야 고를 수 있다 ("워크 '수요일'"만 반복되면 무의미)
+    w13 = dup[1]["works"][0]
+    assert _path_of(dup, "work", w13) == "13주차 > 수요일"
+    assert _path_of(dup, "task", dup[1]["works"][0]["tasks"][0]) == "13주차 > 수요일 > 오전"
+    assert _path_of(dup, "agenda", dup[1]) == "13주차"
+    # 트리에 없는 것도 터지지 않고 이름만 돌려준다
+    assert _path_of(dup, "work", {"id": 999, "title": "없는워크"}) == "없는워크"
+    assert isinstance(_path_of(dup, "work", w13), str)
 
     assert _due("2026-08-07").startswith("2026-08-07T") and _due(None).endswith("Z")
     assert set(_RENAME_PATHS) == {"agenda", "work", "task"}

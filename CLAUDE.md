@@ -100,9 +100,21 @@ run.py → bot.py main()
   | 진행 중인 세션 | `GET /task-session/active` (taskId·제목·경과초 포함 → stop이 인자 불필요) |
   | 태스크 목록 | `GET /project/{pid}/task` (이름→ID 변환용) |
   | 시작 / 중지 | `POST /task/{taskId}/session/start` · `/stop` (바디 없음) |
+  | 4시간 넘긴 중지 | 같은 `/stop`에 `{"selectedParts":[1,2]}` (거절 응답이 준 index) |
   | 3계층 트리 | `GET /project/{pid}/agenda?**completed=true**&page=1&pageSize=100` |
   | 그날 잰 시간 | `GET /task/calendar/user?from=&to=&userId=` (아젠다·워크·태스크·분을 한 번에) |
   | 내 프로젝트 목록 | `GET /legacy-project/my-project` |
+- 아직 **안 쓰는** 엔드포인트 (2026-08-04 전체 cURL 수집. 기능 추가할 때 개발자도구 다시 안 열려고)
+  | 용도 | 요청 |
+  |---|---|
+  | 태스크를 아젠다·워크로 필터 | `GET /project/{pid}/task?agendaId=&workId=` |
+  | 아젠다 이름 서버 검색 | `GET /project/{pid}/agenda?search=&completed=false` |
+  | 그날 완료 태스크 (userId 불필요) | `GET /task/daily-completed-task/user?date=<ISO>` |
+  | 산출물 | `GET /project-output/project/{pid}/output?page=&pageSize=&orderByCreatedAt=` |
+  | 워크 단건 · 아젠다 상태 집계 | `GET /project/{pid}/work/{id}` · `/project/{pid}/agenda/status-count` |
+  | 멤버 | `GET /project/{pid}/member` · `/legacy-project/project/{pid}/member?type=Manager` |
+  | 블레이버스 자체 AI | `GET /project/{pid}/ai/active-jobs` |
+  | (무관) 접속 유지 폴링 | `POST /presence/ping` · `/presence/timer` — 봇엔 불필요 |
 - ⚠️ 함정 3종 (전부 실제로 당함)
   1. `completed=true`는 "완료된 것만"이 **아니라 "완료된 것도 포함"**이다. 빼면 기본값이
      `false`라 끝난 아젠다가 통째로 안 보인다 (9개 → 4개)
@@ -110,6 +122,13 @@ run.py → bot.py main()
      `upcoming`(미완료)은 `duration=null`인 채 **아무 날짜 조회에나 딸려 나온다**.
      `duration` 단위는 **분** (240=4시간 = 설명서의 태스크당 상한)
   3. `my-project`만 응답 키가 `data.list`가 아니라 **`data.message`**다
+  4. **거절 응답에 답이 들어있다.** 서버는 한국어로 이유를 준다 — `raise_for_status()`로
+     본문을 버리면 "400 에러"만 남아 원인을 못 찾는다. `_request()`가 한 곳에서
+     `BlaybusError(message, code, data)`로 바꿔 던진다 (2026-08-04)
+  5. **태스크당 4시간(240분) 상한.** 넘기면 `/stop`이 `STOP_SPLIT_REQUIRED`와 함께
+     **분할안(`parts`)을 계산해서** 준다. 그 `index`만 `{"selectedParts":[1,2]}`로
+     되돌려주면 저장된다 — 조각 시간을 우리가 계산하면 서버와 어긋난다.
+     ⚠️ 분할하면 태스크가 `'오전 (1/2)'`·`'오전 (2/2)'`로 쪼개진다. **이름 중복의 출처가 이것**
 - 사람마다 쿠키함을 따로 둔다(`_clients` dict + `_locks`). 하나를 공유하면 남의 401
   재로그인이 내 쿠키를 덮어쓴다. ⚠️ 잠금 없이 두면 요청 둘이 동시에 로그인한다.
 - 검증 도구: `scripts/blaybus_probe.py` — 읽기 전용. `python -m scripts.blaybus_probe '<경로>'`

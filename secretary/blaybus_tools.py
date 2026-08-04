@@ -17,6 +17,15 @@
 
 아젠다 > 워크 > 태스크 3계층이고, 타이머는 태스크에만 있다.
 
+오류를 다루는 방식 (2026-08-04):
+    서버는 거절할 때 **한국어로 이유를 정확히** 준다. raise_for_status()는 그 본문을
+    버리므로, _request()가 통과 지점 한 곳에서 BlaybusError(message, code, data)로
+    바꿔 던진다. 부르는 쪽 13곳에서 각자 버리던 것을 한 곳으로 모은 것이다.
+    ⚠️ 태스크당 4시간(240분) 상한을 넘기면 그냥 거절하지 않고 STOP_SPLIT_REQUIRED와
+       함께 **분할안(parts)까지 계산해서** 준다. 그 index를 {"selectedParts":[1,2]}로
+       되돌려주면 저장된다. 조각 시간을 우리가 계산하면 서버와 어긋나므로 하지 않는다.
+       분할하면 태스크가 '오전 (1/2)', '오전 (2/2)'로 쪼개진다 — 이름이 겹치는 원인.
+
 도구 9개:
     blaybus_status()            지금 뭐가 돌고 있나
     blaybus_start(...)          이름으로 태스크를 찾아 시간기록 시작
@@ -98,13 +107,16 @@ class BlaybusError(context.UserFacing):
        분할 선택이 필요합니다"라고 한국어로 정확히 알려주고 있었다.
     """
 
-    def __init__(self, message: str, code: str | None = None):
+    def __init__(self, message: str, code: str | None = None, data=None):
         super().__init__(message)
         self.code = code  # 'STOP_SPLIT_REQUIRED'처럼 분기가 필요한 경우를 위해
+        # 거절과 함께 오는 부가 정보. STOP_SPLIT_REQUIRED는 여기에 분할안(parts)을
+        # 담아준다 — 우리가 시간을 계산하지 않고 서버가 준 것을 그대로 되돌려준다.
+        self.data = data
 
 
-def _server_message(resp: httpx.Response) -> tuple[str, str | None]:
-    """오류 응답에서 (사람이 읽을 사유, code)를 뽑는다. JSON이 아니면 본문 앞부분.
+def _server_message(resp: httpx.Response) -> tuple[str, str | None, object]:
+    """오류 응답에서 (사람이 읽을 사유, code, data)를 뽑는다. JSON이 아니면 본문 앞부분.
 
     ⚠️ message가 문자열이 아니라 리스트로 오는 경우가 있다
        (DTO 검증 실패: ["property parts should not exist"]).
@@ -112,21 +124,21 @@ def _server_message(resp: httpx.Response) -> tuple[str, str | None]:
     try:
         body = resp.json()
     except Exception:  # noqa: BLE001 - HTML 오류 페이지 등
-        return (resp.text or "").strip()[:200] or f"HTTP {resp.status_code}", None
+        return (resp.text or "").strip()[:200] or f"HTTP {resp.status_code}", None, None
 
     if not isinstance(body, dict):
-        return f"HTTP {resp.status_code}", None
+        return f"HTTP {resp.status_code}", None, None
     message = body.get("message")
     if isinstance(message, list):
         message = ", ".join(str(m) for m in message)
-    return str(message or f"HTTP {resp.status_code}"), body.get("code")
+    return str(message or f"HTTP {resp.status_code}"), body.get("code"), body.get("data")
 
 
 def _check(resp: httpx.Response, prefix: str = "") -> httpx.Response:
     """오류면 서버가 준 사유를 실어 던진다. 성공이면 그대로 돌려준다."""
     if resp.is_error:
-        message, code = _server_message(resp)
-        raise BlaybusError(f"{prefix}{message}", code)
+        message, code, data = _server_message(resp)
+        raise BlaybusError(f"{prefix}{message}", code, data)
     return resp
 
 
@@ -373,8 +385,9 @@ async def blaybus_start(
     if err:
         return err
 
-    # 트리를 쓰는 이유: /project/{pid}/task는 평평한 목록이라 소속을 알 수 없다.
-    # 되물을 때 '13주차 > 수요일'을 보여주려면 경로가 있어야 한다.
+    # 트리를 쓰는 이유: 되물을 때 '13주차 > 수요일'을 보여주려면 경로가 있어야 한다.
+    # (/project/{pid}/task?agendaId=&workId= 로 좁힐 수는 있지만, 그건 id를 이미
+    #  알 때 얘기다. 우리는 이름만 받으므로 어차피 트리를 한 번 훑어야 한다.)
     triples = _walk(tree)
     if work_title:
         want = _norm(work_title)
@@ -418,12 +431,32 @@ async def blaybus_start(
     return f"'{_describe(agenda, work)} > {task['title']}' 시간기록을 시작했어요."
 
 
+def _split_parts(data) -> list[dict]:
+    """거절 응답에서 서버가 계산해 준 분할안을 꺼낸다. 없으면 빈 목록."""
+    parts = (data or {}).get("parts") if isinstance(data, dict) else None
+    return [p for p in (parts or []) if isinstance(p, dict) and "index" in p]
+
+
+def _describe_parts(parts: list[dict]) -> str:
+    """'240분 + 62분' 처럼 사람이 읽을 분할 모양."""
+    return " + ".join(_duration(int(p.get("durationMinutes") or 0) * 60) for p in parts)
+
+
 @tool
-async def blaybus_stop() -> str:
+async def blaybus_stop(confirm_split: bool = False) -> str:
     """블레이버스에서 돌아가고 있는 시간기록을 멈춘다.
 
     "블레이버스 꺼줘", "퇴근", "그만 기록해" 같은 요청에 쓴다.
-    무엇이 돌고 있는지는 알아서 찾으므로 인자가 필요 없다.
+    무엇이 돌고 있는지는 알아서 찾으므로 보통은 인자 없이 부르면 된다.
+
+    ⚠️ 태스크당 4시간이 상한이라, 넘겨서 켜둔 경우엔 여러 조각으로 나눠 저장해야
+    한다. 그때 이 도구가 "이렇게 나눠 저장할까요?"라고 되돌려주니, 아가씨께
+    여쭙고 **그렇다고 하시면 confirm_split=true로 다시 불러라.**
+    되묻지 않고 바로 true로 부르지 마라 — 블레이버스엔 삭제 기능이 없어서
+    잘못 기록되면 아가씨가 웹에서 손으로 고치셔야 한다.
+
+    Args:
+        confirm_split: 4시간을 넘긴 기록을 나눠 저장해도 된다고 확인받았을 때만 true.
 
     Returns:
         처리 결과 문자열.
@@ -439,22 +472,45 @@ async def blaybus_stop() -> str:
 
     stopped = []
     for s in sessions:
+        path = f"/task/{s['taskId']}/session/stop"
         try:
-            resp = await _request("POST", f"/task/{s['taskId']}/session/stop")
+            await _request("POST", path)
             stopped.append(f"'{s['taskTitle']}' ({_duration(s['elapsedSeconds'])})")
         except BlaybusError as e:
-            # ⚠️ 태스크당 4시간이 상한이라, 넘기면 서버가 "분할해서 저장할래?"를
-            #    물어본다(STOP_SPLIT_REQUIRED + 분할안). 그 확인 요청을 보내는
-            #    형식을 아직 몰라서(웹앱 cURL 미확보) 봇은 멈출 수 없다.
-            #    "실패했어요"로 뭉뚱그리면 아가씨가 계속 다시 시켜보게 된다.
-            if e.code == "STOP_SPLIT_REQUIRED":
+            # ⚠️ 태스크당 4시간이 상한이라, 넘기면 서버가 그냥 거절하지 않고
+            #    "이렇게 나눠 저장할래?"라며 분할안(parts)까지 계산해 준다.
+            #    조각 시간을 우리가 계산하지 않는다 — 서버가 준 index만 되돌려준다.
+            if e.code != "STOP_SPLIT_REQUIRED":
+                return context.as_message(e, f"'{s['taskTitle']}' 중지에 실패했어요")
+
+            parts = _split_parts(e.data)
+            if not parts:  # 분할안을 못 읽으면 지어내지 말고 사유를 그대로 전한다
+                return context.as_message(e, f"'{s['taskTitle']}' 중지에 실패했어요")
+
+            if not confirm_split:
+                n = len(parts)
+                title = s["taskTitle"]
+                # 쪼개지면 태스크 이름이 '오전 (1/2)'처럼 바뀐다. 미리 말해두지 않으면
+                # 나중에 같은 이름이 여럿이라 아가씨가 헷갈리신다.
+                shape = f"'{title} (1/{n})' … '{title} ({n}/{n})'"
                 return (
-                    f"'{s['taskTitle']}'를 {_duration(s['elapsedSeconds'])} 기록했는데, "
-                    "블레이버스는 태스크당 4시간이 상한이라 넘으면 '분할 저장'을 골라야 해요. "
-                    "그건 아직 제가 못 하는 일이라, 웹이나 앱에서 직접 멈추면서 "
-                    "분할을 선택해 주시겠어요? 야레야레..."
+                    f"'{title}' 태스크를 {_duration(s['elapsedSeconds'])} 기록했는데, "
+                    "블레이버스는 태스크당 4시간이 상한이라 나눠서 저장해야 해요. "
+                    f"{_describe_parts(parts)} 이렇게 {n}조각이 되고, "
+                    f"태스크도 {shape}처럼 쪼개져요. "
+                    "그렇게 할까요? (블레이버스엔 삭제가 없어서 한 번 기록되면 "
+                    "아가씨가 웹에서 손으로 고치셔야 해요)"
                 )
-            return context.as_message(e, f"'{s['taskTitle']}' 중지에 실패했어요")
+
+            try:
+                await _request(
+                    "POST", path, json={"selectedParts": [p["index"] for p in parts]}
+                )
+            except Exception as e2:  # noqa: BLE001
+                return context.as_message(e2, f"'{s['taskTitle']}' 분할 저장에 실패했어요")
+            stopped.append(
+                f"'{s['taskTitle']}' ({_describe_parts(parts)}, {len(parts)}조각으로 나눠 저장)"
+            )
         except Exception as e:  # noqa: BLE001
             return context.as_message(e, f"'{s['taskTitle']}' 중지에 실패했어요")
     return f"블레이버스 시간기록을 멈췄어요: {', '.join(stopped)}"
@@ -900,8 +956,9 @@ def _selftest() -> None:
             "data": {"capMinutes": 240, "currentMinutes": 302},
         },
     )
-    message, code = _server_message(split)
+    message, code, data = _server_message(split)
     assert "240분" in message and code == "STOP_SPLIT_REQUIRED", (message, code)
+    assert data["currentMinutes"] == 302
 
     # message가 리스트로 오는 경우(DTO 검증 실패)도 문장으로 합쳐야 한다
     listy = httpx.Response(400, json={"message": ["property parts should not exist"], "code": "002"})
@@ -928,6 +985,64 @@ def _selftest() -> None:
         raise AssertionError("401인데 통과했다")
     except BlaybusError as e:
         assert str(e) == "블레이버스 로그인이 거부됐어요: 비밀번호가 틀렸습니다"
+
+    # --- 분할 저장 (2026-08-04 웹앱 cURL: {"selectedParts":[1,2]}) --------------
+    # ⚠️ 조각 시간을 우리가 계산하면 서버와 어긋난다. index만 되돌려주는지 본다.
+    real_parts = [
+        {"index": 1, "startAt": "2026-08-04T00:15:26.000Z", "durationMinutes": 240},
+        {"index": 2, "startAt": "2026-08-04T04:15:26.000Z", "durationMinutes": 62},
+    ]
+    parts = _split_parts({"capMinutes": 240, "currentMinutes": 302, "parts": real_parts})
+    assert [p["index"] for p in parts] == [1, 2]
+    assert _describe_parts(parts) == "4시간 0분 + 1시간 2분", _describe_parts(parts)
+
+    # 분할안이 없거나 모양이 다르면 빈 목록 — 지어내지 않는다 (없으면 사유를 그대로 전한다)
+    assert _split_parts(None) == [] and _split_parts({}) == []
+    assert _split_parts({"parts": None}) == []
+    assert _split_parts({"parts": [{"noIndex": 1}]}) == []
+    assert isinstance(_split_parts({"parts": real_parts}), list)
+
+    # 확인 전에는 저장하면 안 된다 — 모델이 보는 스키마에서 기본값이 False여야
+    # 그냥 "멈춰줘"에 한 번 여쭙는 단계를 거친다.
+    schema = blaybus_stop.args_schema.model_json_schema()["properties"]["confirm_split"]
+    assert schema.get("default") is False, schema
+
+    # blaybus_stop 흐름을 가짜 서버로 통째로 확인한다.
+    # ⚠️ 실 계정으로 시험하면 4시간짜리 세션을 만들어야 하고, 블레이버스엔 삭제가
+    #    없어서 잔여물이 영구히 남는다. 그래서 _request만 갈아끼워 확인한다.
+    global _request
+
+    real_request, sent = _request, []
+
+    async def _fake(method, path, **kwargs):
+        body = kwargs.get("json")
+        sent.append((method, path, body))
+        if path == "/task-session/active":
+            return httpx.Response(200, json={"data": {"list": [
+                {"taskId": 1, "taskTitle": "오전", "elapsedSeconds": 18130}
+            ]}})
+        if body is None:  # 확인 없는 stop → 서버가 분할을 요구한다
+            return _check(httpx.Response(400, json={
+                "message": "프로젝트의 태스크 최대 기록 시간(240분)을 초과합니다.",
+                "code": "STOP_SPLIT_REQUIRED",
+                "data": {"capMinutes": 240, "currentMinutes": 302, "parts": real_parts},
+            }))
+        return httpx.Response(200, json={"data": {}})
+
+    _request = _fake
+    try:
+        # ① 그냥 "멈춰줘" → 저장하지 말고 여쭤야 한다
+        msg = asyncio.run(blaybus_stop.ainvoke({}))
+        assert "나눠서 저장" in msg and "(1/2)" in msg and "4시간 0분 + 1시간 2분" in msg, msg
+        assert all(body is None for _, _, body in sent), "확인 전에 뭔가를 저장했다"
+
+        # ② 확인받은 뒤 → 서버가 준 index를 그대로 되돌려준다
+        sent.clear()
+        msg = asyncio.run(blaybus_stop.ainvoke({"confirm_split": True}))
+        assert sent[-1] == ("POST", "/task/1/session/stop", {"selectedParts": [1, 2]}), sent[-1]
+        assert "나눠 저장" in msg, msg
+    finally:
+        _request = real_request
 
     print("selftest OK")
 

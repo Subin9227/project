@@ -89,13 +89,54 @@ def _project_id() -> str:
     return context.require(context.active().blaybus_pid, "블레이버스")
 
 
+class BlaybusError(context.UserFacing):
+    """서버가 요청을 거절했다. 메시지는 서버가 준 한국어 사유 그대로.
+
+    ⚠️ 이 클래스가 생긴 이유: 예전엔 raise_for_status()가 응답 **본문을 버렸다.**
+       그래서 아가씨는 "400 에러를 내면서 거부하고 있어요"만 보고 뭘 해야 할지
+       알 수 없었다. 정작 서버는 "태스크 최대 기록 시간(240분)을 초과합니다.
+       분할 선택이 필요합니다"라고 한국어로 정확히 알려주고 있었다.
+    """
+
+    def __init__(self, message: str, code: str | None = None):
+        super().__init__(message)
+        self.code = code  # 'STOP_SPLIT_REQUIRED'처럼 분기가 필요한 경우를 위해
+
+
+def _server_message(resp: httpx.Response) -> tuple[str, str | None]:
+    """오류 응답에서 (사람이 읽을 사유, code)를 뽑는다. JSON이 아니면 본문 앞부분.
+
+    ⚠️ message가 문자열이 아니라 리스트로 오는 경우가 있다
+       (DTO 검증 실패: ["property parts should not exist"]).
+    """
+    try:
+        body = resp.json()
+    except Exception:  # noqa: BLE001 - HTML 오류 페이지 등
+        return (resp.text or "").strip()[:200] or f"HTTP {resp.status_code}", None
+
+    if not isinstance(body, dict):
+        return f"HTTP {resp.status_code}", None
+    message = body.get("message")
+    if isinstance(message, list):
+        message = ", ".join(str(m) for m in message)
+    return str(message or f"HTTP {resp.status_code}"), body.get("code")
+
+
+def _check(resp: httpx.Response, prefix: str = "") -> httpx.Response:
+    """오류면 서버가 준 사유를 실어 던진다. 성공이면 그대로 돌려준다."""
+    if resp.is_error:
+        message, code = _server_message(resp)
+        raise BlaybusError(f"{prefix}{message}", code)
+    return resp
+
+
 async def _login(client: httpx.AsyncClient, login_id: str, password: str) -> None:
     resp = await client.post(
         "/auth/user/sign-in",
         json={"loginId": login_id, "password": password},
         headers=_ORIGIN_HEADERS,
     )
-    resp.raise_for_status()  # 쿠키 3종은 client.cookies에 자동 저장된다
+    _check(resp, "블레이버스 로그인이 거부됐어요: ")  # 쿠키 3종은 자동 저장된다
 
 
 async def _request(method: str, path: str, **kwargs) -> httpx.Response:
@@ -105,6 +146,9 @@ async def _request(method: str, path: str, **kwargs) -> httpx.Response:
     오는데, 그때 무한 재로그인하면 계정 잠금을 스스로 부른다.
     ⚠️ 이제 남의 계정도 다루므로 이 규칙이 더 중요하다 — 되풀이하면 남의 계정을
        잠근다.
+
+    오류는 여기서 BlaybusError로 던진다. 부르는 쪽마다 raise_for_status()를 하면
+    서버가 준 사유를 13곳에서 각자 버리게 되므로, 통과 지점 한 곳에서 처리한다.
     """
     key, login_id, password = _creds()
     context.require(login_id and password, "블레이버스")
@@ -126,7 +170,7 @@ async def _request(method: str, path: str, **kwargs) -> httpx.Response:
         async with _locks[key]:
             await _login(client, login_id, password)
         resp = await client.request(method, path, headers=_headers(), **kwargs)
-    return resp
+    return _check(resp)
 
 
 def _norm(text: str) -> str:
@@ -181,14 +225,12 @@ async def _tree() -> list[dict]:
     resp = await _request(
         "GET", f"/project/{_project_id()}/agenda?completed=true&page=1&pageSize=100"
     )
-    resp.raise_for_status()
     return resp.json()["data"]["list"]
 
 
 async def _my_id() -> int:
     """태스크 생성에 필요한 assignee. 계정이 바뀌면 조용히 남의 태스크를 만들게 되므로 박아두지 않는다."""
     resp = await _request("GET", "/auth/user/info")
-    resp.raise_for_status()
     return resp.json()["data"]["id"]
 
 
@@ -289,7 +331,6 @@ async def blaybus_status() -> str:
     """
     try:
         resp = await _request("GET", "/task-session/active")
-        resp.raise_for_status()
         sessions = resp.json()["data"]["list"]
     except Exception as e:  # noqa: BLE001 - 도구는 예외를 문자열로 돌려줘야 전달된다
         return context.as_message(e, "블레이버스 상태를 못 봤어요")
@@ -372,7 +413,6 @@ async def blaybus_start(
     agenda, work, task = hits[0]
     try:
         resp = await _request("POST", f"/task/{task['id']}/session/start")
-        resp.raise_for_status()
     except Exception as e:  # noqa: BLE001
         return context.as_message(e, f"'{task['title']}' 시작에 실패했어요")
     return f"'{_describe(agenda, work)} > {task['title']}' 시간기록을 시작했어요."
@@ -390,7 +430,6 @@ async def blaybus_stop() -> str:
     """
     try:
         resp = await _request("GET", "/task-session/active")
-        resp.raise_for_status()
         sessions = resp.json()["data"]["list"]
     except Exception as e:  # noqa: BLE001
         return context.as_message(e, "블레이버스 상태를 못 봤어요")
@@ -402,10 +441,22 @@ async def blaybus_stop() -> str:
     for s in sessions:
         try:
             resp = await _request("POST", f"/task/{s['taskId']}/session/stop")
-            resp.raise_for_status()
             stopped.append(f"'{s['taskTitle']}' ({_duration(s['elapsedSeconds'])})")
+        except BlaybusError as e:
+            # ⚠️ 태스크당 4시간이 상한이라, 넘기면 서버가 "분할해서 저장할래?"를
+            #    물어본다(STOP_SPLIT_REQUIRED + 분할안). 그 확인 요청을 보내는
+            #    형식을 아직 몰라서(웹앱 cURL 미확보) 봇은 멈출 수 없다.
+            #    "실패했어요"로 뭉뚱그리면 아가씨가 계속 다시 시켜보게 된다.
+            if e.code == "STOP_SPLIT_REQUIRED":
+                return (
+                    f"'{s['taskTitle']}'를 {_duration(s['elapsedSeconds'])} 기록했는데, "
+                    "블레이버스는 태스크당 4시간이 상한이라 넘으면 '분할 저장'을 골라야 해요. "
+                    "그건 아직 제가 못 하는 일이라, 웹이나 앱에서 직접 멈추면서 "
+                    "분할을 선택해 주시겠어요? 야레야레..."
+                )
+            return context.as_message(e, f"'{s['taskTitle']}' 중지에 실패했어요")
         except Exception as e:  # noqa: BLE001
-            return context.as_message(e, "'{s['taskTitle']}' 중지에 실패했어요")
+            return context.as_message(e, f"'{s['taskTitle']}' 중지에 실패했어요")
     return f"블레이버스 시간기록을 멈췄어요: {', '.join(stopped)}"
 
 
@@ -470,9 +521,8 @@ async def blaybus_add_agenda(title: str) -> str:
         resp = await _request(
             "POST", f"/project/{_project_id()}/agenda", json={"title": title}
         )
-        resp.raise_for_status()
     except Exception as e:  # noqa: BLE001
-        return context.as_message(e, "아젠다 '{title}' 생성에 실패했어요")
+        return context.as_message(e, f"아젠다 '{title}' 생성에 실패했어요")
     return f"블레이버스에 아젠다 '{title}'를 만들었어요."
 
 
@@ -505,9 +555,8 @@ async def blaybus_add_work(work_title: str, agenda_title: str, date: str | None 
             f"/project/{_project_id()}/agenda/{agenda['id']}/work",
             json={"title": work_title, "date": _due(date)},
         )
-        resp.raise_for_status()
     except Exception as e:  # noqa: BLE001
-        return context.as_message(e, "워크 '{work_title}' 생성에 실패했어요")
+        return context.as_message(e, f"워크 '{work_title}' 생성에 실패했어요")
     return f"아젠다 '{agenda['title']}'에 워크 '{work_title}'를 만들었어요."
 
 
@@ -577,7 +626,6 @@ async def blaybus_add_task(
                 "position": None,
             },
         )
-        resp.raise_for_status()
     except Exception as e:  # noqa: BLE001
         return context.as_message(e, f"태스크 '{task_title}' 생성에 실패했어요")
     return f"'{_describe(agenda, work)}'에 태스크 '{task_title}'를 만들었어요."
@@ -660,7 +708,6 @@ async def blaybus_rename(
     path = _RENAME_PATHS[found_kind].format(pid=_project_id(), id=item["id"])
     try:
         resp = await _request("POST", path, json={"title": new_title})
-        resp.raise_for_status()
     except Exception as e:  # noqa: BLE001
         return context.as_message(e, "이름 변경에 실패했어요")
     return f"{_KIND_KR[found_kind]} '{item['title']}'를 '{new_title}'로 바꿨어요."
@@ -698,7 +745,6 @@ async def blaybus_today_tasks(date: str = "today") -> str:
         resp = await _request(
             "GET", f"/task/calendar/user?from={day}&to={day}&userId={uid}"
         )
-        resp.raise_for_status()
         # ⚠️ source로 반드시 거른다. 'upcoming'(미완료)은 duration이 없는 채로
         #    조회 날짜와 무관하게 딸려 나온다 — 안 거르면 남의 날 일이 섞인다.
         done = [t for t in resp.json()["data"]["list"] if t.get("source") == "completed"]
@@ -709,7 +755,6 @@ async def blaybus_today_tasks(date: str = "today") -> str:
         running = []
         if day == today:
             active = await _request("GET", "/task-session/active")
-            active.raise_for_status()
             running = active.json()["data"]["list"]
     except Exception as e:  # noqa: BLE001
         return context.as_message(e, "블레이버스 조회 중 오류")
@@ -844,6 +889,45 @@ def _selftest() -> None:
 
     assert _due("2026-08-07").startswith("2026-08-07T") and _due(None).endswith("Z")
     assert set(_RENAME_PATHS) == {"agenda", "work", "task"}
+
+    # --- 서버가 준 사유를 버리지 않는가 (2026-08-04 실측 응답 그대로) -----------
+    # 예전엔 raise_for_status()가 본문을 버려서 "400 에러"만 남았다.
+    split = httpx.Response(
+        400,
+        json={
+            "message": "프로젝트의 태스크 최대 기록 시간(240분)을 초과합니다. 분할 선택이 필요합니다.",
+            "code": "STOP_SPLIT_REQUIRED",
+            "data": {"capMinutes": 240, "currentMinutes": 302},
+        },
+    )
+    message, code = _server_message(split)
+    assert "240분" in message and code == "STOP_SPLIT_REQUIRED", (message, code)
+
+    # message가 리스트로 오는 경우(DTO 검증 실패)도 문장으로 합쳐야 한다
+    listy = httpx.Response(400, json={"message": ["property parts should not exist"], "code": "002"})
+    assert _server_message(listy)[0] == "property parts should not exist"
+
+    # JSON이 아니면(HTML 오류 페이지 등) 터지지 말고 본문 앞부분을 준다
+    assert "HTTP 502" in _server_message(httpx.Response(502, text=""))[0]
+    assert _server_message(httpx.Response(500, text="<html>oops</html>"))[0] == "<html>oops</html>"
+
+    # _check: 성공은 그대로 통과, 실패는 BlaybusError로 던진다
+    ok = httpx.Response(200, json={"data": {}})
+    assert _check(ok) is ok
+    try:
+        _check(split)
+        raise AssertionError("400인데 통과했다")
+    except BlaybusError as e:
+        assert e.code == "STOP_SPLIT_REQUIRED"
+        # ⚠️ 예외 타입 이름이 아가씨께 새면 안 된다 — UserFacing이라 그대로 나가야 한다
+        shown = context.as_message(e, "중지에 실패했어요")
+        assert shown.startswith("프로젝트의 태스크") and "BlaybusError" not in shown, shown
+    # 로그인 실패는 접두사가 붙는다 (어느 단계에서 막혔는지 알아야 한다)
+    try:
+        _check(httpx.Response(401, json={"message": "비밀번호가 틀렸습니다"}), "블레이버스 로그인이 거부됐어요: ")
+        raise AssertionError("401인데 통과했다")
+    except BlaybusError as e:
+        assert str(e) == "블레이버스 로그인이 거부됐어요: 비밀번호가 틀렸습니다"
 
     print("selftest OK")
 

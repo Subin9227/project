@@ -30,7 +30,16 @@ from secretary import config, users
 _current: ContextVar[users.User | None] = ContextVar("current_user", default=None)
 
 
-class NotConfigured(RuntimeError):
+class UserFacing(RuntimeError):
+    """메시지가 이미 '아가씨께 할 말'인 예외. as_message가 그대로 내보낸다.
+
+    ⚠️ 이걸 안 나누면 예외 타입 이름이 답변에 샌다
+       ("…: BlaybusError: 240분을 초과합니다"). 서비스가 한국어로 정확히
+       알려준 이유를 그대로 전달하는 게 목적이라, 포장을 한 겹 벗긴다.
+    """
+
+
+class NotConfigured(UserFacing):
     """아직 연결하지 않은 서비스를 쓰려 할 때.
 
     ⚠️ 이 예외가 있는 이유: 예전엔 값이 없으면 `or .env값`으로 폴백했다. 그런데
@@ -63,11 +72,11 @@ def require(value, what: str):
 def as_message(e: Exception, what: str) -> str:
     """도구가 사용자에게 돌려줄 오류 문장.
 
-    NotConfigured는 이미 사람에게 할 말이므로 그대로 낸다. 안 그러면
+    UserFacing은 이미 사람에게 할 말이므로 그대로 낸다. 안 그러면
     "블레이버스 목록을 못 봤어요: NotConfigured: 블레이버스가…"처럼 겹친다.
     그 밖의 예외는 진단이 되도록 타입을 붙여 둔다.
     """
-    if isinstance(e, NotConfigured):
+    if isinstance(e, UserFacing):
         return str(e)
     return f"{what}: {type(e).__name__}: {e}"
 
@@ -130,6 +139,14 @@ def _selftest() -> None:
     assert msg == "블레이버스가 아직 연결 안 됐어요." and "NotConfigured" not in msg
     # 그 밖의 예외는 진단이 되게 타입을 남긴다
     assert "ValueError" in as_message(ValueError("boom"), "못 봤어요")
+    # UserFacing 하위형이면 NotConfigured가 아니어도 그대로 나가야 한다
+    # (blaybus_tools.BlaybusError가 서버의 한국어 사유를 이 길로 전달한다)
+    assert issubclass(NotConfigured, UserFacing)
+
+    class _Sample(UserFacing):
+        pass
+
+    assert as_message(_Sample("240분을 초과합니다."), "못 봤어요") == "240분을 초과합니다."
 
     fake = users.User(discord_id="111", notion_token="ntn_fake", routine_ds_id="rt")
     token = set_current(fake)

@@ -33,7 +33,13 @@ from secretary.alarms import (
     resolve_target,
 )
 from secretary.commands import setup_commands
-from secretary.config import DISCORD_BOT_TOKEN, KST, MEMORY_DB_PATH, OWNER_ID
+from secretary.config import (
+    DISCORD_BOT_TOKEN,
+    KST,
+    MEMORY_DB_PATH,
+    MEMORY_KEEP_DAYS,
+    OWNER_ID,
+)
 from secretary.webserver import attach_client, build_health_server
 
 # 디스코드 한 메시지의 최대 길이. 초과분은 잘라서 보낸다.
@@ -46,8 +52,9 @@ RECURSION_LIMIT = 12
 # 겹2: 한 메시지 처리의 벽시계 상한(초). 넘으면 중단하고 사과 답장.
 AGENT_TIMEOUT_SEC = 90
 
-# 대화기억을 며칠치 남길지. 오늘 포함이므로 7 = 오늘~6일 전.
-KEEP_DAYS = 7
+# 대화기억을 며칠치 남길지. 오늘 포함이므로 7 = 오늘~6일 전. 0이면 안 지운다.
+# 값은 .env의 MEMORY_KEEP_DAYS로 바꾼다 (config.py 참고).
+KEEP_DAYS = MEMORY_KEEP_DAYS
 
 
 def _today_kst() -> str:
@@ -69,7 +76,13 @@ async def _prune_old_threads(checkpointer: AsyncSqliteSaver) -> int:
 
     ponytail: 시작할 때 1회. 프로세스가 몇 달씩 안 죽으면 그때 main()의
     asyncio.gather에 하루 한 번 도는 태스크로 올린다.
+
+    KEEP_DAYS가 0이면 한 건도 안 지운다(테스트 기간용). 지워버리면 사용자들이
+    무슨 말을 했고 봇이 어떻게 답했는지 되짚을 방법이 사라진다.
     """
+    if KEEP_DAYS <= 0:
+        return 0
+
     today = datetime.now(KST).date()
     keep = {(today - timedelta(days=d)).isoformat() for d in range(KEEP_DAYS)}
 
@@ -164,7 +177,11 @@ async def main() -> None:
     # (async with 블록이 유지되는 동안 SQLite 연결이 살아있다.)
     async with AsyncSqliteSaver.from_conn_string(str(MEMORY_DB_PATH)) as checkpointer:
         pruned = await _prune_old_threads(checkpointer)
-        if pruned:
+        if KEEP_DAYS <= 0:
+            # 꺼져 있다고 말해주지 않으면 '조용한 것'과 '지울 게 없는 것'을 구분할 수 없다
+            size_mb = MEMORY_DB_PATH.stat().st_size / 1024 / 1024
+            print(f"대화기억 정리: 꺼짐 (MEMORY_KEEP_DAYS=0, 현재 {size_mb:.1f}MB)")
+        elif pruned:
             size_mb = MEMORY_DB_PATH.stat().st_size / 1024 / 1024
             print(f"낡은 대화기억 {pruned}개 정리 완료 (현재 {size_mb:.1f}MB)")
 

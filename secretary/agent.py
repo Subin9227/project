@@ -29,7 +29,7 @@ from secretary.config import (
 )
 from secretary.blaybus_tools import BLAYBUS_TOOLS
 from secretary.homework_tools import HOMEWORK_TOOLS
-from secretary.notion_tools import ROUTINE_TOOLS
+from secretary.notion_tools import ROUTINE_TOOLS, item_guide
 from secretary.onboarding import DEFAULT_MODEL
 from secretary.persona import SYSTEM_PROMPT
 
@@ -77,6 +77,14 @@ _PIN_LINE = {
 }
 
 
+# 데일리루틴 항목과 아가씨가 부르실 만한 다른 이름. notion_tools가 유일한 출처다.
+# 모델이 도구를 부르기 전에 판단하므로 프롬프트에 실어야 한다 — 자세한 이유는 item_guide().
+_ITEM_LINE = (
+    "\n\n[노션 데일리루틴 항목은 여섯 개뿐이고, 괄호 안 이름으로 말씀하셔도 같은 항목이다: "
+    f"{item_guide()}] 괄호 안 이름을 들으시면 되묻지 말고 그대로 도구에 넣어라."
+)
+
+
 def _prompt_with_today(state):
     """매 메시지마다 실행되어 '오늘 날짜'를 시스템 메시지에 새로 주입한다.
 
@@ -121,7 +129,8 @@ def _prompt_with_today(state):
     last_said = msgs[human_at[-1]].content if human_at else ""
     pin = _pinned_place(last_said) if isinstance(last_said, str) else None
 
-    return [SystemMessage(content=SYSTEM_PROMPT + today_line + _PIN_LINE.get(pin, "")), *recent]
+    prompt = SYSTEM_PROMPT + _ITEM_LINE + today_line + _PIN_LINE.get(pin, "")
+    return [SystemMessage(content=prompt), *recent]
 
 
 def _build_model(user):
@@ -260,6 +269,12 @@ def _selftest() -> None:
     prompt = _prompt_with_today({"messages": msgs})[0].content
     assert "노션" in prompt and "blaybus_* 는 부르지 마라" in prompt
     assert _PIN_LINE["blaybus"] not in prompt
+
+    # 항목 별칭이 실제로 프롬프트에 실려야 한다. 모델은 도구를 부르기 전에 판단한다.
+    assert "미라클모닝" in prompt and "헬스" in prompt and "야자" in prompt
+    # ⚠️ 목록의 출처는 notion_tools 하나. persona가 사본을 들면 노션에서 이름을 바꿀 때
+    #    한쪽만 고쳐져 어긋난다 — 오늘 사고가 정확히 그 어긋남이었다.
+    assert "코테/도착 8시/운동" not in SYSTEM_PROMPT
 
     # 도구 답에는 어느 기록처인지 표가 붙는다. 이름 규칙만으로 갈린다.
     assert _tag_of("routine_check") == "[노션] "

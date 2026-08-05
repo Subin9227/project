@@ -105,6 +105,23 @@ def _resolve_item(item: str) -> str | None:
     return None
 
 
+def item_guide() -> str:
+    """모델에게 줄 '항목과 그 별칭' 한 줄. agent.py가 시스템 메시지에 싣는다.
+
+    ⚠️ 별칭은 _resolve_item() 안에서만 도는데, 그건 **도구가 실행된 뒤**의 코드다.
+       모델은 그 앞에서 판단하므로, 알려주지 않으면 '미라클모닝'을 없는 항목으로 보고
+       도구를 아예 안 부른다(2026-08-05 실제 발생). ITEMS·ALIASES가 유일한 출처라,
+       별칭을 늘리면 프롬프트가 저절로 따라온다.
+    """
+    said_as: dict[str, list[str]] = {key: [] for key in ITEMS}
+    for said, key in ALIASES.items():
+        said_as[key].append(said)
+    return " / ".join(
+        f"{prop}({'·'.join(said_as[key])})" if said_as[key] else prop
+        for key, prop in ITEMS.items()
+    )
+
+
 # --- 노션 REST 헬퍼 -------------------------------------------------------
 def _routine_ds() -> str:
     """지금 요청 주인의 루틴 DB.
@@ -890,6 +907,16 @@ def _selftest() -> None:
 
     # 그래도 모르는 말은 노션까지 가지 않는다 (비슷한 걸 임의로 켜면 안 된다)
     assert _resolve_item("명상") is None and _resolve_item("") is None
+
+    # ⚠️ 별칭은 프롬프트에 실려야 쓸모가 있다. 모델은 도구를 부르기 **전에** 판단하므로,
+    #    이 한 줄에서 빠진 별칭은 "그런 항목 없어요"로 막힌다(2026-08-05 '미라클모닝').
+    guide = item_guide()
+    for said in ALIASES:
+        assert said in guide, said
+    for prop in ITEMS.values():
+        assert prop in guide, prop
+    assert guide.count(" / ") == len(ITEMS) - 1, guide  # 항목 여섯 개가 한 줄에
+    assert "회고(" not in guide  # 별칭 없는 항목은 빈 괄호를 달지 않는다
 
     # 중복 판정은 _norm 기준 — 공백이 달라도 같은 줄로 본다
     existing = {_norm(t) for t in ["임베딩 정리", "검증 데이터 정리"]}

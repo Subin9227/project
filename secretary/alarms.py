@@ -59,12 +59,19 @@ def _parse_time(text: str) -> time:
 
 
 def _parse_weekly(text: str) -> tuple[int, time]:
-    """'MON 08:00' → (0, time(8, 0)). 요일이 없으면 월요일로 본다."""
+    """'MON 08:00' → (0, time(8, 0)). 요일이 없으면 월요일로 본다.
+
+    ⚠️ 모르는 요일은 ValueError. 예전엔 .get(day, 0)으로 **조용히 월요일**이 됐고,
+       'wen'이라 쓴 사람은 수요일로 설정한 줄 알고 기다렸다(2026-08-05).
+       틀린 채 도는 것보다 그 사람 스케줄을 빼고 알리는 쪽이 낫다.
+    """
     parts = text.strip().split()
     if len(parts) == 1:
         return 0, _parse_time(parts[0])
     day, clock = parts[0].upper(), parts[1]
-    return _WEEKDAYS.get(day, 0), _parse_time(clock)
+    if day not in _WEEKDAYS:
+        raise ValueError(f"모르는 요일: {parts[0]!r} (MON~SUN)")
+    return _WEEKDAYS[day], _parse_time(clock)
 
 
 @dataclass(frozen=True)
@@ -121,31 +128,42 @@ def load_schedules() -> list[Schedule]:
     by_target: dict[str, Schedule] = {}
 
     if ALARM_TARGET:
-        day, at = _parse_weekly(WEEKLY_TIME)
-        by_target[ALARM_TARGET] = Schedule(
-            target=ALARM_TARGET,
-            mention_id=ALARM_MENTION,
-            work_start=_parse_time(WORK_START_TIME),
-            work_end=_parse_time(WORK_END_TIME),
-            weekly_day=day,
-            weekly_at=at,
-        )
+        try:
+            day, at = _parse_weekly(WEEKLY_TIME)
+            by_target[ALARM_TARGET] = Schedule(
+                target=ALARM_TARGET,
+                mention_id=ALARM_MENTION,
+                work_start=_parse_time(WORK_START_TIME),
+                work_end=_parse_time(WORK_END_TIME),
+                weekly_day=day,
+                weekly_at=at,
+            )
+        except ValueError as e:
+            print(f"⚠️ .env의 알림 시각을 못 읽어 건너뜁니다: {e}")
 
     if users.enabled():
         for u in users.all_users():
-            # 알림 받을 곳을 안 정했으면 건너뛴다 (/setup을 아직 안 한 사람)
-            if not u.alarm_target:
+            # 받을 곳을 안 정했거나(/setup 전) 꺼둔 사람은 건너뛴다.
+            # 꺼둬도 alarm_target은 남아 있어서 '/setup target:여기'로 바로 되살아난다.
+            if not u.alarm_target or u.alarm_off:
                 continue
-            day, at = _parse_weekly(u.weekly_at or WEEKLY_TIME)
-            by_target[u.alarm_target] = Schedule(
-                target=u.alarm_target,
-                mention_id=u.alarm_mention,
-                work_start=_parse_time(u.work_start or WORK_START_TIME),
-                work_end=_parse_time(u.work_end or WORK_END_TIME),
-                weekly_day=day,
-                weekly_at=at,
-                owner=u,
-            )
+            # ⚠️ 한 사람의 값이 깨졌다고 여기서 예외가 새면 alarm_loop 자체가 멈춰
+            #    **전원의 알림이 조용히 끊긴다**(tasks.loop은 예외를 만나면 선다).
+            #    못 읽는 사람만 빼고 나머지는 살린다 — users._to_user와 같은 원칙.
+            try:
+                day, at = _parse_weekly(u.weekly_at or WEEKLY_TIME)
+                by_target[u.alarm_target] = Schedule(
+                    target=u.alarm_target,
+                    mention_id=u.alarm_mention,
+                    work_start=_parse_time(u.work_start or WORK_START_TIME),
+                    work_end=_parse_time(u.work_end or WORK_END_TIME),
+                    weekly_day=day,
+                    weekly_at=at,
+                    owner=u,
+                )
+            except ValueError as e:
+                print(f"⚠️ {u.discord_id}의 알림 설정을 못 읽어 건너뜁니다: {e} "
+                      "— /setup으로 다시 넣어야 알림이 갑니다")
     return list(by_target.values())
 
 

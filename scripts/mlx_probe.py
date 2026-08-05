@@ -22,12 +22,11 @@ import argparse
 import asyncio
 import json
 import time
-from datetime import datetime
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from secretary.agent import build_tools
-from secretary.config import KST, MAX_TOKENS
+from secretary.agent import _prompt_with_today, build_tools
+from secretary.config import MAX_TOKENS
 from secretary.persona import SYSTEM_PROMPT
 
 # (사용자 발화, 기대하는 도구 이름 후보들). 후보가 여럿인 건 두 경로가 다 말이 되는 경우다.
@@ -36,8 +35,11 @@ CASES: list[tuple[str, tuple[str, ...]]] = [
     ("오늘 루틴 어떻게 돼?", ("routine_today",)),
     ("지금 뭐 하고 있었지?", ("blaybus_status",)),
     ("이번 주 과제 뭐 남았어?", ("homework_status",)),
-    # 이름이 중복이라 되묻는 게 맞지만, 그러려면 먼저 목록을 봐야 한다 (#8-4)
-    ("오전 작업 시작해줘", ("blaybus_start", "blaybus_list")),
+    # 이름이 중복이라 되묻는 게 맞지만, 그러려면 먼저 목록을 봐야 한다 (#8-4).
+    # ⚠️ blaybus_status도 정답이다. '오전' 태스크가 11개라 바로 시작할 수 없고,
+    #    지금 돌아가는 게 있는지 보는 것도 합리적인 첫 수순이다. 처음엔 빼뒀는데,
+    #    그래서 9B가 맞게 행동하고도 오답으로 세어졌다(2026-08-05).
+    ("오전 작업 시작해줘", ("blaybus_start", "blaybus_list", "blaybus_status")),
     ("그만할래", ("blaybus_stop",)),
 ]
 
@@ -68,9 +70,16 @@ LEAN_PROMPT = SYSTEM_PROMPT.split("[실행 원칙]")[0] + (
 )
 
 
-def _today_line() -> str:
-    now = datetime.now(KST)
-    return f"\n\n[오늘은 {now:%Y-%m-%d}이에요.]"
+def _system_prompt(lean: bool) -> str:
+    """봇이 실제로 보내는 시스템 메시지 그대로.
+
+    ⚠️ SYSTEM_PROMPT만 쓰면 안 된다. 오늘 날짜와 데일리루틴 항목 별칭은
+       agent.py `_prompt_with_today()`가 붙이므로, 여기서 직접 조립하면
+       봇보다 짧은 프롬프트로 재게 된다(2026-08-05에 실제로 197자가 빠졌다).
+       그 함수를 그대로 불러 어긋날 여지를 없앤다.
+    """
+    built = _prompt_with_today({"messages": [HumanMessage(content="측정용")]})[0].content
+    return built if not lean else built.replace(SYSTEM_PROMPT, LEAN_PROMPT)
 
 
 async def main() -> int:
@@ -81,45 +90,67 @@ async def main() -> int:
     #    VLLM_API_KEY 기본값('not-needed')으로는 401이 난다 — .env에 넣어줘야 한다.
     ap.add_argument("--api-key", default="sk-optiq-local")
     ap.add_argument("--persona", choices=("full", "lean"), default="full")
+    # ⚠️ temperature=0.7(봇과 같은 값)이라 같은 설정도 회차마다 흔들린다. 6케이스 1회로는
+    #    프롬프트 차이를 못 가른다 — 실제로 같은 조건에서 2/6·3/6·4/6이 다 나왔다
+    #    (2026-08-05). 여러 번 돌려 케이스별 성공 횟수로 봐야 한다.
+    ap.add_argument("--repeat", type=int, default=3)
     args = ap.parse_args()
-    prompt = SYSTEM_PROMPT if args.persona == "full" else LEAN_PROMPT
+    prompt = _system_prompt(args.persona == "lean")
 
     tools = build_tools()
     names = sorted(t.name for t in tools)
     print(f"도구 {len(tools)}개: {', '.join(names)}\n")
     assert len(tools) == 17, f"도구 개수가 17이 아니다: {len(tools)}"
 
-    # 스키마가 실제로 몇 글자나 실리는지 — 12주차 컨텍스트 문제의 크기를 눈으로 본다
-    schema_chars = sum(len(json.dumps(t.args_schema.model_json_schema())) for t in tools)
+    # 도구 목록이 실제로 몇 글자나 실리는지 — 12주차 컨텍스트 문제의 크기를 눈으로 본다.
+    # ⚠️ 둘 다 실제 페이로드에 맞춰야 한다.
+    #    ① ensure_ascii=False — 기본값이면 한글 한 자가 '오' 여섯 자로 부푼다
+    #    ② description(=docstring)도 함께 센다. 인자 스키마만 세면 절반이 빠지는데,
+    #       모델을 움직이는 안내문이 대부분 거기 있다(routine_write 하나가 1,175자).
+    schema_chars = sum(
+        len(json.dumps(
+            {"name": t.name, "description": t.description,
+             "input_schema": t.args_schema.model_json_schema()},
+            ensure_ascii=False,
+        ))
+        for t in tools
+    )
     print(f"도구 스키마 총 {schema_chars:,}자 (대략 {schema_chars // 3:,} 토큰) "
           f"+ 페르소나({args.persona}) {len(prompt):,}자\n")
 
     llm = _build_llm(args.base_url, args.model, args.api_key).bind_tools(tools)
-    system = SystemMessage(content=prompt + _today_line())
+    system = SystemMessage(content=prompt)
 
-    passed, times = 0, []
-    for said, wanted in CASES:
-        start = time.monotonic()
-        try:
-            reply = await llm.ainvoke([system, HumanMessage(content=said)])
-        except Exception as e:  # noqa: BLE001 - 무엇이 터지든 나머지 케이스는 계속 잰다
-            print(f"❌ {said!r}\n     터짐: {type(e).__name__}: {str(e)[:200]}")
-            times.append(time.monotonic() - start)
-            continue
-        elapsed = time.monotonic() - start
-        times.append(elapsed)
+    hits: dict[str, int] = {said: 0 for said, _ in CASES}
+    times: list[float] = []
+    for round_no in range(1, args.repeat + 1):
+        for said, wanted in CASES:
+            start = time.monotonic()
+            try:
+                reply = await llm.ainvoke([system, HumanMessage(content=said)])
+            except Exception as e:  # noqa: BLE001 - 무엇이 터지든 나머지 케이스는 계속 잰다
+                print(f"❌ {said!r}\n     터짐: {type(e).__name__}: {str(e)[:200]}")
+                times.append(time.monotonic() - start)
+                continue
+            elapsed = time.monotonic() - start
+            times.append(elapsed)
 
-        called = [c["name"] for c in (reply.tool_calls or [])]
-        hit = any(c in wanted for c in called)
-        passed += hit
-        mark = "✅" if hit else "❌"
-        detail = ", ".join(
-            f"{c['name']}({json.dumps(c['args'], ensure_ascii=False)})"
-            for c in (reply.tool_calls or [])
-        ) or f"(도구 안 부름) {str(reply.content)[:80]!r}"
-        print(f"{mark} {said!r}  {elapsed:5.1f}s\n     기대 {wanted} → 실제 {detail}")
+            called = [c["name"] for c in (reply.tool_calls or [])]
+            hit = any(c in wanted for c in called)
+            hits[said] += hit
+            detail = ", ".join(
+                f"{c['name']}({json.dumps(c['args'], ensure_ascii=False)})"
+                for c in (reply.tool_calls or [])
+            ) or f"(도구 안 부름) {str(reply.content)[:80]!r}"
+            print(f"{'✅' if hit else '❌'} [{round_no}] {said!r}  {elapsed:5.1f}s\n"
+                  f"     기대 {wanted} → 실제 {detail}")
 
-    print(f"\n{passed}/{len(CASES)} 통과")
+    print(f"\n케이스별 성공 (각 {args.repeat}회)")
+    for said, _ in CASES:
+        print(f"  {hits[said]}/{args.repeat}  {said}")
+    total = sum(hits.values())
+    denom = len(CASES) * args.repeat
+    print(f"\n{total}/{denom} 통과 ({total / denom:.0%})")
     if times:
         ordered = sorted(times)
         median = ordered[len(ordered) // 2]
@@ -127,7 +158,7 @@ async def main() -> int:
         # ReAct 루프는 한 메시지에 LLM을 2~4번 부른다. 봇 타임아웃은 그 합을 견뎌야 한다.
         print(f"→ 메시지 1건(호출 4회) 예상 {median * 4:.0f}s "
               f"(현재 AGENT_TIMEOUT_SEC=90)")
-    return 0 if passed == len(CASES) else 1
+    return 0 if total == denom else 1
 
 
 if __name__ == "__main__":

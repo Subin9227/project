@@ -27,6 +27,7 @@ from secretary.config import (
     VLLM_BASE_URL,
     VLLM_MODEL,
 )
+from secretary.blaybus_tools import BLAYBUS_TOOLS
 from secretary.homework_tools import HOMEWORK_TOOLS
 from secretary.notion_tools import ROUTINE_TOOLS
 from secretary.onboarding import DEFAULT_MODEL
@@ -42,6 +43,38 @@ _WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
 # (사진 → "어느 항목?" → "운동")는 이어져야 하므로 2턴이면 충분하다.
 # (무한 누적 → 토큰 폭증을 막는 핵심 장치)
 RECENT_WINDOW = 2
+
+
+# 사용자가 기록처를 콕 집어 말했는지 알아볼 낱말.
+_NOTION_WORDS = ("노션", "notion")
+_BLAYBUS_WORDS = ("블레이버스", "blaybus")
+
+
+def _pinned_place(text: str) -> str | None:
+    """마지막 발화에서 기록처를 집어냈으면 'notion' | 'blaybus'. 아니면 None.
+
+    둘 다 말했으면 None — 어느 쪽도 막지 않는다("노션이랑 블레이버스 둘 다 보여줘").
+    """
+    low = (text or "").lower()
+    notion = any(w in low for w in _NOTION_WORDS)
+    blaybus = any(w in low for w in _BLAYBUS_WORDS)
+    if notion == blaybus:  # 둘 다거나 둘 다 아니면 고정하지 않는다
+        return None
+    return "notion" if notion else "blaybus"
+
+
+_PIN_LINE = {
+    "notion": (
+        "\n\n[⚠️ 지금 아가씨는 **노션**이라고 하셨다. 앞 대화에서 블레이버스 작업을 하던 "
+        "중이라도 그건 접어두고 노션 도구(routine_*·homework_*)만 써라. "
+        "blaybus_* 는 부르지 마라 — 아가씨가 기록처를 바로잡으신 것이다.]"
+    ),
+    "blaybus": (
+        "\n\n[⚠️ 지금 아가씨는 **블레이버스**라고 하셨다. 앞 대화에서 노션 작업을 하던 "
+        "중이라도 그건 접어두고 블레이버스 도구(blaybus_*)만 써라. "
+        "routine_*·homework_* 는 부르지 마라 — 아가씨가 기록처를 바로잡으신 것이다.]"
+    ),
+}
 
 
 def _prompt_with_today(state):
@@ -78,7 +111,17 @@ def _prompt_with_today(state):
     start = human_at[-RECENT_WINDOW] if len(human_at) >= RECENT_WINDOW else 0
     recent = msgs[start:]
 
-    return [SystemMessage(content=SYSTEM_PROMPT + today_line), *recent]
+    # ⚠️ 마지막 발화가 앞 대화에 눌리는 문제(잔류 앵커링). 날짜와 같은 병이라 같은
+    #    약을 쓴다 — 시스템 메시지로 격상시킨다.
+    #    2026-08-05: "노션에 태스크 만들어줘"로 블레이버스 되묻기가 시작되자, 그 뒤
+    #    "노션에 추가해줘"(11자)가 직전 도구 결과의 블레이버스 낱말 덩어리에 눌려
+    #    세 번을 말해도 계속 blaybus_*로 갔다.
+    #    ⚠️ 마지막 '메시지'가 아니라 마지막 '사람 메시지'를 본다. 이 함수는 도구를
+    #       부를 때마다 다시 실행되는데, 그때 msgs[-1]은 도구 결과라 고정이 풀린다.
+    last_said = msgs[human_at[-1]].content if human_at else ""
+    pin = _pinned_place(last_said) if isinstance(last_said, str) else None
+
+    return [SystemMessage(content=SYSTEM_PROMPT + today_line + _PIN_LINE.get(pin, "")), *recent]
 
 
 def _build_model(user):
@@ -116,6 +159,32 @@ def _build_model(user):
     )
 
 
+def _tag_of(name: str) -> str:
+    return "[블레이버스] " if name.startswith("blaybus_") else "[노션] "
+
+
+def _tagged(tool):
+    """도구 답을 '[노션] '/'[블레이버스] '로 시작하게 감싼다.
+
+    도구 반환 문구는 아가씨께 하는 말이자 **모델에게 주는 다음 지시**다. 그런데
+    노션 도구의 답에는 '노션'이라는 낱말이 안 들어가고 블레이버스 도구의 답에는
+    '태스크·워크·아젠다'가 잔뜩 들어간다. 그 비대칭 때문에 되묻기 한 바퀴만 돌면
+    모델이 기록처를 블레이버스로 착각했다(2026-08-05).
+
+    도구 문구를 하나하나 고치는 대신 여기서 한 번에 붙인다 — 새 도구가 생겨도
+    이름만 blaybus_* 규칙을 따르면 저절로 붙는다.
+    """
+    inner = tool.coroutine
+    tag = _tag_of(tool.name)
+
+    async def wrapped(*args, **kwargs):
+        out = await inner(*args, **kwargs)
+        return tag + out if isinstance(out, str) else out
+
+    tool.coroutine = wrapped
+    return tool
+
+
 def build_tools() -> list:
     """도구 목록. 누구에게나 똑같다.
 
@@ -124,9 +193,12 @@ def build_tools() -> list:
        계정이 없으면 도구가 "등록해 주세요"라고 답하게 한다.
        덕분에 그래프는 모델만 다르면 되고, 캐시가 훨씬 잘 듣는다.
     """
-    from secretary.blaybus_tools import BLAYBUS_TOOLS
+    return _TOOLS
 
-    return ROUTINE_TOOLS + HOMEWORK_TOOLS + BLAYBUS_TOOLS
+
+# ⚠️ 감싸기는 import 시점에 딱 한 번. build_tools()가 불릴 때마다 감싸면 사람이
+#    늘수록 태그가 '[노션] [노션] …'로 겹친다(도구 객체가 모듈 전역이라 공유된다).
+_TOOLS = [_tagged(t) for t in ROUTINE_TOOLS + HOMEWORK_TOOLS + BLAYBUS_TOOLS]
 
 
 # 모델이 같으면 그래프도 같으니 재사용한다. 열쇠는 '뇌의 생김새'다.
@@ -163,3 +235,54 @@ async def build_agent(checkpointer, user=None):
     )
     _agents[key] = agent
     return agent
+
+
+def _selftest() -> None:
+    import asyncio
+
+    # 기록처를 하나만 집어 말했을 때만 고정한다
+    assert _pinned_place("노션에 추가해줘") == "notion"
+    assert _pinned_place("블레이버스 태스크 만들어줘") == "blaybus"
+    assert _pinned_place("오늘 뭐 했지") is None
+    assert _pinned_place("노션이랑 블레이버스 둘 다 보여줘") is None
+    assert _pinned_place("") is None
+
+    # ⚠️ 도구 결과가 뒤에 붙어도 고정이 풀리면 안 된다(이 버그를 잡으려고 만든 것).
+    #    _prompt_with_today는 도구를 부를 때마다 다시 실행되므로 마지막 '메시지'가
+    #    아니라 마지막 '사람 메시지'를 봐야 한다.
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    msgs = [
+        HumanMessage(content="노션에 추가해줘"),
+        AIMessage(content="", tool_calls=[{"name": "blaybus_list", "args": {}, "id": "t1"}]),
+        ToolMessage(content="[블레이버스] 아젠다 '13주차' > 워크 '수요일'", tool_call_id="t1"),
+    ]
+    prompt = _prompt_with_today({"messages": msgs})[0].content
+    assert "노션" in prompt and "blaybus_* 는 부르지 마라" in prompt
+    assert _PIN_LINE["blaybus"] not in prompt
+
+    # 도구 답에는 어느 기록처인지 표가 붙는다. 이름 규칙만으로 갈린다.
+    assert _tag_of("routine_check") == "[노션] "
+    assert _tag_of("homework_write") == "[노션] "
+    assert _tag_of("blaybus_stop") == "[블레이버스] "
+    names = {t.name for t in build_tools()}
+    assert len(names) == 17, names
+
+    # ⚠️ 감싸기가 두 번 걸리면 '[노션] [노션] …'이 된다.
+    #    자격증명이 빈 사람으로 불러 안내문만 받는다 — 셀프테스트가 망을 타면 안 된다.
+    from secretary import context, users
+
+    token = context.set_current(users.User(discord_id="selftest"))
+    try:
+        status = next(t for t in build_tools() if t.name == "blaybus_status")
+        out = asyncio.run(status.coroutine())
+    finally:
+        context.reset(token)
+    assert out.startswith("[블레이버스] "), out
+    assert not out.startswith("[블레이버스] [블레이버스] "), out
+
+    print("selftest OK")
+
+
+if __name__ == "__main__":
+    _selftest()

@@ -83,7 +83,7 @@ def _row_summary(row: dict) -> str:
 
 @tool
 async def homework_status(week: str = "") -> str:
-    """과제 제출 현황을 본다.
+    """**노션** 과제 제출 DB에서 제출 현황을 본다.
 
     "이번 주 과제 냈나?", "과제 어디까지 했지?" 같은 물음에 쓴다.
 
@@ -120,7 +120,7 @@ async def homework_status(week: str = "") -> str:
 
 @tool
 async def homework_create(week: str, title: str = "") -> str:
-    """그 주차의 과제 행을 템플릿대로 만들고 '진행중'으로 표시한다.
+    """**노션** 과제 제출 DB에 그 주차 행을 템플릿대로 만들고 '진행중'으로 표시한다.
 
     ⚠️ 같은 주차 행이 이미 있으면 만들지 않는다 (빈 껍데기가 쌓이는 걸 막는다).
 
@@ -172,7 +172,7 @@ async def homework_create(week: str, title: str = "") -> str:
 
 @tool
 async def homework_write(week: str, section: str, text: str) -> str:
-    """과제 행의 특정 칸(헤딩) 아래에 아가씨가 준 글을 그대로 옮겨 적는다.
+    """**노션** 과제 행의 특정 칸(헤딩) 아래에 아가씨가 준 글을 그대로 옮겨 적는다.
 
     ⚠️ 내용을 지어내지 마라. 아가씨가 준 글만 옮긴다.
     칸 이름은 템플릿에 있는 그대로 — 예: '과제 결과', '회고', '상황 한줄 정리'.
@@ -223,7 +223,7 @@ async def homework_write(week: str, section: str, text: str) -> str:
 
 @tool
 async def homework_complete(week: str) -> str:
-    """그 주차 과제를 '진행완료'로 바꾼다.
+    """**노션** 과제를 그 주차만 '진행완료'로 바꾼다.
 
     ⚠️ 반드시 아가씨에게 "정말 다 끝난 거예요?"라고 한 번 더 물어보고,
     그렇다는 답을 들은 뒤에만 호출해라. 되돌리려면 노션에서 손으로 고쳐야 한다.

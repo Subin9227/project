@@ -27,8 +27,9 @@ from langgraph.errors import GraphRecursionError
 from secretary import context, users
 from secretary.agent import build_agent, build_tools
 from secretary.alarms import (
-    _WEEKDAY_KR,
+    audit_users,
     build_alarm_loop,
+    format_audit,
     load_schedules,
     resolve_target,
 )
@@ -139,28 +140,67 @@ def _allowed(discord_id: str) -> bool:
     return bool(user and user.registered)
 
 
-async def _describe_target(client: discord.Client, schedule) -> str:
-    """알림이 실제로 어디로 갈지 사람이 읽을 수 있게.
+async def _describe_target(client: discord.Client, target: str) -> tuple[str, bool]:
+    """알림이 실제로 어디로 갈지 (사람이 읽을 이름, 닿는가).
 
     기동할 때 확인시켜 주는 게 핵심이다: 채널 ID를 잘못 넣으면 알림 시각이
     되어서야 실패를 알게 되는데, 그땐 이미 한 번 놓친 뒤다.
+    ⚠️ '닿는가'는 채널이 살아있고 봇이 볼 수 있다는 뜻일 뿐이다. 사람이 다른
+       채널로 옮겨간 경우는 여기서 못 잡는다 — 옛 채널로 잘 배달된다.
     """
     try:
-        dest, kind = await resolve_target(client, schedule.target)
+        dest, kind = await resolve_target(client, target)
     except Exception as e:  # noqa: BLE001
-        return (
-            f"⚠️ {schedule.target}를 채널로도 사람으로도 못 찾았어요 "
-            f"({type(e).__name__}) — 이대로면 알림이 안 갑니다"
-        )
+        return f"⚠️ {target} ({type(e).__name__})", False
 
     if kind == "user":
-        return f"DM → {dest}"
+        return f"DM → {dest}", True
 
     name = getattr(dest, "name", None) or str(dest)
     guild = getattr(dest, "guild", None)
-    where = f"{guild.name} / #{name}" if guild else f"#{name}"
-    mention = " (멘션 켬)" if schedule.mention_id else " (멘션 없음)"
-    return f"{where}{mention}"
+    return (f"{guild.name} / #{name}" if guild else f"#{name}"), True
+
+
+async def _display_name(client: discord.Client, uid: str) -> str:
+    """디스코드에서 보이는 이름. 서버 별명이 있으면 그게 우선.
+
+    fetch_user는 계정 아이디(hwamgai)만 준다. 사람들이 서로를 알아보는 건
+    서버 별명('linda.hwang(황수빈)/인공지능')이라, 서버 쪽을 먼저 뒤진다.
+    ⚠️ members 인텐트가 없어 캐시가 비어 있으므로 fetch_member로 물어본다.
+       서버 수만큼 호출될 수 있지만 기동할 때 한 번뿐이다.
+    """
+    for guild in client.guilds:
+        member = guild.get_member(int(uid))  # 캐시에 있으면 공짜
+        if member is not None:
+            return member.display_name
+    for guild in client.guilds:
+        try:
+            return (await guild.fetch_member(int(uid))).display_name
+        except Exception:  # noqa: BLE001 - 그 서버에 없는 사람
+            continue
+    try:  # 어느 서버에서도 못 찾으면 계정 이름이라도
+        user = await client.fetch_user(int(uid))
+        return user.display_name
+    except Exception:  # noqa: BLE001 - 탈퇴 등
+        return "(이름 못 찾음)"
+
+
+async def _alarm_table(client: discord.Client) -> str:
+    """기동 로그에 찍을 알림 표. ID를 사람 이름·채널 이름으로 바꿔 넣는다.
+
+    이름 조회는 등록자 수만큼 API를 부르므로 기동이 조금 느려진다. 봇은 자주 켜지
+    않고, 이 표를 보는 목적이 '누가 언제 받나'라서 ID만으로는 쓸모가 없다.
+    """
+    rows = audit_users()
+    names: dict[str, str] = {}
+    for row in rows:
+        uid = row["discord_id"]
+        if uid and uid not in names:
+            names[uid] = await _display_name(client, uid)
+        # 받을 곳이 없는 사람은 물어볼 것도 없다 ('연결' 칸은 '—'로 남는다)
+        if row["target"]:
+            row["place"], row["reach"] = await _describe_target(client, row["target"])
+    return format_audit(rows, names, OWNER_ID)
 
 
 async def main() -> None:
@@ -222,19 +262,16 @@ async def main() -> None:
             count = len(users.all_users()) if users.enabled() else 0
             print(f"   등록된 사용자: {count}명  (자세히는 /users)")
 
+            # 등록자 전원을 표로. 알림이 안 가는 사람도 '왜 안 가는지'까지 보여준다 —
+            # 예전엔 가는 것만 찍어서, 등록만 하고 /setup을 안 한 사람이 안 보였다.
+            print(await _alarm_table(client))
+
             # 알림은 로그인 뒤에 켠다 (DM을 보내려면 게이트웨이가 붙어 있어야 한다).
             # on_ready는 재접속 때도 불리므로 이미 돌고 있으면 다시 켜지 않는다.
-            schedules = load_schedules()
-            if not schedules:
+            if not load_schedules():
                 print("   알림: 꺼짐 (ALARM_TARGET도 /setup도 없음)")
             elif not alarm_loop.is_running():
                 alarm_loop.start()
-                for s in schedules:
-                    print(f"   알림 → {await _describe_target(client, s)}")
-                    print(
-                        f"        업무 {s.work_start:%H:%M}~{s.work_end:%H:%M}, "
-                        f"주간 {_WEEKDAY_KR[s.weekly_day]} {s.weekly_at:%H:%M}"
-                    )
 
         @client.event
         async def on_message(message: discord.Message):

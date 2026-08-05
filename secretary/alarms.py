@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import traceback
+import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 
@@ -165,6 +166,122 @@ def load_schedules() -> list[Schedule]:
                 print(f"⚠️ {u.discord_id}의 알림 설정을 못 읽어 건너뜁니다: {e} "
                       "— /setup으로 다시 넣어야 알림이 갑니다")
     return list(by_target.values())
+
+
+def audit_users() -> list[dict]:
+    """등록자 전원 + .env를 '알림이 갈까 안 갈까'로 한 줄씩. 기동 로그 표에 쓴다.
+
+    load_schedules()와 따로 두는 이유:
+        그쪽은 알림 루프가 1분마다 부르는 실행 경로라 **가는 것만** 돌려준다.
+        그래서 안 가는 사람이 조용히 빠지고, 왜 안 가는지 알 방법이 없다.
+        여기는 안 가는 사람도 이유를 달아 내놓는다.
+
+    status: 'on'(감) | 'unset'(/setup 전) | 'off'(꺼둠) | 'error'(값이 깨짐)
+    """
+    rows: list[dict] = []
+
+    def row(owner, target, work_start, work_end, weekly, off) -> dict:
+        out = {
+            "owner": owner,  # None이면 .env 몫
+            "discord_id": getattr(owner, "discord_id", None),
+            "target": target,
+            "work": None,
+            "weekly": None,
+            "status": "on",
+            "reason": None,
+        }
+        if not target:
+            out["status"] = "unset"
+            return out
+        if off:
+            out["status"] = "off"
+        try:
+            day, at = _parse_weekly(weekly)
+            out["work"] = f"{_parse_time(work_start):%H:%M}~{_parse_time(work_end):%H:%M}"
+            out["weekly"] = f"{_WEEKDAY_KR[day]} {at:%H:%M}"
+        except ValueError as e:
+            out["status"] = "error"
+            out["reason"] = str(e)
+        return out
+
+    if ALARM_TARGET:
+        rows.append(row(None, ALARM_TARGET, WORK_START_TIME, WORK_END_TIME, WEEKLY_TIME, False))
+    if users.enabled():
+        for u in users.all_users():
+            rows.append(row(
+                u, u.alarm_target,
+                u.work_start or WORK_START_TIME, u.work_end or WORK_END_TIME,
+                u.weekly_at or WEEKLY_TIME, bool(u.alarm_off),
+            ))
+
+    # ⚠️ 받을 곳이 겹치면 load_schedules()의 by_target에서 나중 것이 이겨 하나만 남는다.
+    #    표가 '켜짐'이라고 해놓고 실제로 안 가면 거짓말이 되므로, 실제로 살아남은
+    #    줄인지 대조해 진 쪽은 'shadowed'로 표시한다.
+    live = {s.target: getattr(s.owner, "discord_id", None) for s in load_schedules()}
+    for r in rows:
+        if r["status"] == "on" and live.get(r["target"]) != r["discord_id"]:
+            r["status"] = "shadowed"
+    return rows
+
+
+_STATUS_KR = {
+    "on": "✅ 켜짐",
+    "unset": "➖ 미설정",
+    "off": "⏸ 꺼둠",
+    "error": "⚠️ 오류",
+    "shadowed": "🔁 덮임",
+}
+
+
+def describe_owner(owner) -> str:
+    """발송 로그에 쓸 짧은 주인 표기. .env 몫이면 '(.env)'."""
+    return "(.env)" if owner is None else f"…{owner.discord_id[-4:]}"
+
+
+def _width(text: str) -> int:
+    """한글은 두 칸을 먹는다. len()으로 맞추면 표가 어긋난다."""
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
+
+
+def _pad(text: str, width: int) -> str:
+    return text + " " * max(0, width - _width(text))
+
+
+def format_audit(rows: list[dict], names: dict[str, str], owner_id: str | None) -> str:
+    """audit_users() 결과를 기동 로그에 찍을 표로. names는 {discord_id: 사람 이름}.
+
+    '설정'과 '연결'을 따로 세우는 이유: 앞은 DB만 보면 알고, 뒤는 디스코드에
+    물어봐야 안다. 한 칸에 뭉치면 '받겠다고 해놓고 못 받는 중'이 안 보인다.
+    """
+    cells = []
+    for r in rows:
+        uid = r["discord_id"]
+        who = "(.env)" if uid is None else f"{names.get(uid, '(이름 못 찾음)')} ({uid})"
+        reach = r.get("reach")
+        cells.append([
+            "👑" if uid and uid == owner_id else "  ",
+            who,
+            r.get("place") or (r["target"] or "—"),
+            r["work"] or "—",
+            r["weekly"] or "—",
+            _STATUS_KR.get(r["status"], r["status"]) + (f" — {r['reason']}" if r["reason"] else ""),
+            "—" if reach is None else ("✅ 닿음" if reach else "❌ 못 닿음"),
+        ])
+
+    head = ["", "사용자", "받을 곳", "업무", "주간", "설정", "연결"]
+    widths = [max(_width(row[i]) for row in [head, *cells]) for i in range(len(head))]
+    lines = ["  " + "  ".join(_pad(h, w) for h, w in zip(head, widths)).rstrip()]
+    lines.append("  " + "─" * (sum(widths) + 2 * (len(widths) - 1)))
+    lines += ["  " + "  ".join(_pad(c, w) for c, w in zip(row, widths)).rstrip() for row in cells]
+
+    on = sum(1 for r in rows if r["status"] == "on")
+    people = sum(1 for r in rows if r["discord_id"])
+    header = f"알림 — 등록 {people}명" + (" + .env" if len(rows) > people else "") + f" · 켜짐 {on}곳"
+    footer = (
+        f"  .env 기본값 (시각을 안 정한 사람이 물려받음): "
+        f"업무 {WORK_START_TIME}~{WORK_END_TIME} · 주간 {WEEKLY_TIME}"
+    )
+    return "\n".join([f"   {header}", *lines, footer])
 
 
 def due_kinds(schedule: Schedule, now: datetime) -> list[str]:
@@ -331,11 +448,16 @@ def build_alarm_loop(client):
                 # 알림 본문은 노션·블레이버스를 조회해서 만든다. 그 조회가 **이 알림의
                 # 주인** 것이어야 한다 — 안 심으면 전원의 알림에 주인 데이터가 실린다.
                 ctx_token = context.set_current(schedule.owner)
+                who = describe_owner(schedule.owner)
                 try:
                     dest, _ = await resolve_target(client, schedule.target)
                     await dest.send(schedule.prefix + await build_message(kind, now))
-                    print(f"[알림] {kind} → {dest}")
-                except Exception:  # noqa: BLE001 - 알림이 터져도 봇은 살아야 한다
+                    print(f"[알림 {now:%H:%M}] {kind} → {dest} ({who}) ✅")
+                except Exception as e:  # noqa: BLE001 - 알림이 터져도 봇은 살아야 한다
+                    # ⚠️ 예전엔 실패하면 traceback만 떠서 '안 갔다'를 알아채기 어려웠다.
+                    #    성공과 같은 모양의 한 줄을 먼저 찍어 눈에 걸리게 한다.
+                    print(f"[알림 {now:%H:%M}] {kind} → {schedule.target} ({who}) "
+                          f"❌ {type(e).__name__}: {str(e)[:80]}")
                     traceback.print_exc()
                 finally:
                     context.reset(ctx_token)
@@ -376,6 +498,65 @@ def _selftest() -> None:
     assert due_kinds(s, mon.replace(day=4, hour=8)) == []
     # 반환이 list인지까지 본다 — len()만 세면 틀린 이유로 통과한다 (#8-2 함정)
     assert isinstance(due_kinds(s, mon), list)
+
+    # --- 기동 표: 등록자 전원이 '왜 가고 왜 안 가는지'까지 보여야 한다 -----------
+    # (2026-08-05: 가는 것만 찍어서 등록만 하고 /setup 안 한 사람이 안 보였다)
+    import tempfile
+
+    from cryptography.fernet import Fernet
+
+    import secretary.users as U
+
+    real_path, real_key, real_env = U.USERS_DB_PATH, U.CRED_KEY, ALARM_TARGET
+    U.USERS_DB_PATH = tempfile.mktemp(suffix=".sqlite")
+    U.CRED_KEY = Fernet.generate_key().decode()
+    globals()["ALARM_TARGET"] = None
+    try:
+        U.save("on1", llm_provider="anthropic", llm_key="k",
+               alarm_target="ch1", work_start="09:00", weekly_at="WED 07:40")
+        U.save("unset", llm_provider="anthropic", llm_key="k")
+        U.save("off1", llm_provider="anthropic", llm_key="k",
+               alarm_target="ch2", alarm_off="1")
+        U.save("bad", llm_provider="anthropic", llm_key="k",
+               alarm_target="ch3", work_start="8시40분")
+        rows = {r["discord_id"]: r for r in audit_users()}
+        assert rows["on1"]["status"] == "on", rows["on1"]
+        assert rows["on1"]["weekly"] == "수 07:40", rows["on1"]
+        assert rows["unset"]["status"] == "unset" and rows["unset"]["work"] is None
+        assert rows["off1"]["status"] == "off", rows["off1"]
+        assert rows["bad"]["status"] == "error" and "8시40분" in rows["bad"]["reason"]
+        # 안 가는 사람도 표에 남아야 한다 — load_schedules()는 이들을 버린다
+        assert len(rows) == 4 and len(load_schedules()) == 1
+
+        # 같은 곳을 두 사람이 가리키면 하나만 실제로 나간다 → 진 쪽은 '덮임'
+        U.save("dup", llm_provider="anthropic", llm_key="k", alarm_target="ch1")
+        got = {r["discord_id"]: r["status"] for r in audit_users()}
+        assert sorted([got["on1"], got["dup"]]) == ["on", "shadowed"], got
+
+        # 표가 그려지고 주인 줄에만 👑가 붙는다
+        rows = audit_users()
+        table = format_audit(rows, {"on1": "철수", "unset": "영희"}, "on1")
+        assert "👑" in table and table.count("👑") == 1, table
+        assert "철수 (on1)" in table and "영희 (unset)" in table, table
+        assert "⚠️ 오류" in table and "➖ 미설정" in table and "⏸ 꺼둠" in table, table
+        assert isinstance(table, str)
+
+        # '설정'과 '연결'은 다른 질문이다 — 켜뒀는데 못 닿는 경우가 보여야 한다
+        for r in rows:
+            r["reach"] = {"on1": True, "off1": False}.get(r["discord_id"])
+        table = format_audit(rows, {}, None)
+        assert "✅ 닿음" in table and "❌ 못 닿음" in table, table
+        # 받을 곳이 없는 사람은 물어볼 것도 없으니 '—'
+        unset_line = next(ln for ln in table.splitlines() if "(unset)" in ln)
+        assert unset_line.rstrip().endswith("—"), unset_line
+        assert "👑" not in table  # owner_id가 None이면 아무 줄에도 안 붙는다
+    finally:
+        U.USERS_DB_PATH, U.CRED_KEY = real_path, real_key
+        globals()["ALARM_TARGET"] = real_env
+
+    # 한글 폭 계산 — len()으로 맞추면 표가 어긋난다
+    assert _width("가나") == 4 and _width("ab") == 2 and _width("가b") == 3
+    assert _pad("가", 4) == "가  " and _width(_pad("가", 4)) == 4
 
     # 지난주 범위는 요일과 무관하게 같아야 한다 (WEEKLY_TIME을 금요일로 바꿔도)
     assert _last_week_range(date(2026, 8, 3)) == ("2026-07-27", "2026-08-03")  # 월

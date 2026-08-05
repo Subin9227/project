@@ -53,6 +53,11 @@ RECURSION_LIMIT = 12
 # 겹2: 한 메시지 처리의 벽시계 상한(초). 넘으면 중단하고 사과 답장.
 AGENT_TIMEOUT_SEC = 90
 
+# LangGraph가 스텝 부족일 때 답변 자리에 끼워 넣는 문장. 예외가 아니라 평범한
+# AIMessage로 오기 때문에, 문자열로 알아보는 수밖에 없다.
+# ⚠️ 라이브러리가 문구를 바꾸면 조용히 안 걸린다 → 셀프테스트가 실제 소스를 확인한다.
+LANGGRAPH_OUT_OF_STEPS = "Sorry, need more steps to process this request."
+
 # 대화기억을 며칠치 남길지. 오늘 포함이므로 7 = 오늘~6일 전. 0이면 안 지운다.
 # 값은 .env의 MEMORY_KEEP_DAYS로 바꾼다 (config.py 참고).
 KEEP_DAYS = MEMORY_KEEP_DAYS
@@ -121,7 +126,16 @@ def _extract_text(message) -> str:
             if isinstance(block, dict) and block.get("type") == "text"
         ]
         text = "".join(parts)
-    text = text.strip() or "야레야레... 아가씨, 지금은 드릴 말씀이 마땅치 않네요."
+    text = text.strip()
+    # ⚠️ create_react_agent는 스텝이 모자라면 **예외를 던지지 않고** 이 영어 문장을
+    #    보통 답변처럼 돌려준다(langgraph/prebuilt/chat_agent_executor.py).
+    #    그래서 아래 GraphRecursionError 핸들러가 안 걸리고 아가씨가 영어를 본다.
+    if text == LANGGRAPH_OUT_OF_STEPS:
+        text = (
+            "야레야레 아가씨, 이것저것 찾아보다 제 걸음 수를 다 썼어요. "
+            "한 번에 하나씩, 조금만 더 구체적으로 말씀해 주시겠어요?"
+        )
+    text = text or "야레야레... 아가씨, 지금은 드릴 말씀이 마땅치 않네요."
     return text[:DISCORD_MAX_LEN]
 
 
@@ -400,3 +414,33 @@ async def main() -> None:
             client.start(DISCORD_BOT_TOKEN),
             health_server.serve(),
         )
+
+
+def _selftest() -> None:
+    """디스코드 없이 확인할 수 있는 것만. 나머지는 실제 기동으로 본다."""
+    import inspect
+
+    from langchain_core.messages import AIMessage
+    from langgraph.prebuilt import chat_agent_executor
+
+    # ⚠️ 이 문장이 라이브러리와 어긋나면 영어가 그대로 아가씨께 나간다.
+    #    langgraph를 올릴 때 여기서 걸리라고 실제 소스를 확인한다.
+    assert LANGGRAPH_OUT_OF_STEPS in inspect.getsource(chat_agent_executor), (
+        "langgraph의 스텝 부족 문구가 바뀌었다 — LANGGRAPH_OUT_OF_STEPS를 맞출 것"
+    )
+    got = _extract_text(AIMessage(content=LANGGRAPH_OUT_OF_STEPS))
+    assert "야레야레" in got and "Sorry" not in got, got
+
+    # 평범한 답변은 그대로, 빈 답변은 페르소나 문구로
+    assert _extract_text(AIMessage(content="네, 아가씨!")) == "네, 아가씨!"
+    assert "드릴 말씀이" in _extract_text(AIMessage(content="  "))
+    # 블록 리스트에서 text만 뽑는다 (tool_use 블록은 버린다)
+    blocks = [{"type": "text", "text": "가"}, {"type": "tool_use", "name": "x"}]
+    assert _extract_text(AIMessage(content=blocks)) == "가"
+    # 2000자 상한
+    assert len(_extract_text(AIMessage(content="가" * 3000))) == DISCORD_MAX_LEN
+    print("selftest OK")
+
+
+if __name__ == "__main__":
+    _selftest()

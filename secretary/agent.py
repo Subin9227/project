@@ -281,7 +281,7 @@ def _selftest() -> None:
     assert _tag_of("homework_write") == "[노션] "
     assert _tag_of("blaybus_stop") == "[블레이버스] "
     names = {t.name for t in build_tools()}
-    assert len(names) == 17, names
+    assert len(names) == 18, names
 
     # ⚠️ 감싸기가 두 번 걸리면 '[노션] [노션] …'이 된다.
     #    자격증명이 빈 사람으로 불러 안내문만 받는다 — 셀프테스트가 망을 타면 안 된다.

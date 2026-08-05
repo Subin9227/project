@@ -404,6 +404,45 @@ async def _section_blocks(
     return out
 
 
+def _level(block: dict) -> int:
+    """헤딩 깊이. heading_2 → 2. 헤딩이 아니면 0."""
+    kind = block.get("type") or ""
+    return int(kind[-1]) if kind in _HEADINGS else 0
+
+
+def _section_lines(blocks: list[dict], section: str) -> list[str] | None:
+    """그 칸에 적힌 글. 칸이 없으면 None, 비어 있으면 빈 목록.
+
+    ⚠️ `_section_blocks`와 달리 **하위 칸까지 훑는다.** '회고'(h2)는 자기 바로 밑이
+       비어 있고 글은 전부 h3('오늘 한 일' 등) 아래에 있다. 다음 헤딩에서 멈추면
+       "회고에 뭐 써있어?"에 늘 '비어 있음'이 나온다.
+       그래서 **자기와 같거나 위 단계의 헤딩**을 만날 때까지 간다.
+    """
+    target = _norm(section)
+    depth: int | None = None
+    out: list[str] = []
+    for block in blocks:
+        lv = _level(block)
+        if depth is None:
+            if lv and _norm(_heading_text(block) or "") == target:
+                depth = lv
+            continue
+        if lv:
+            if lv <= depth:
+                break
+            out.append(f"[{_heading_text(block)}]")  # 하위 칸은 이름표만 남긴다
+            continue
+        text = _paragraph_text(block)
+        if text and text.strip():
+            out.append(text.strip())
+        elif block.get("type") == "image":
+            out.append("(사진)")
+    if depth is None:
+        return None
+    # 이름표만 있고 내용이 하나도 없으면 빈 칸으로 본다
+    return [] if all(s.startswith("[") and s.endswith("]") for s in out) else out
+
+
 def _append_anchor(section: list[dict], heading_id: str) -> str:
     """덧붙일 때 어느 블록 뒤에 넣을지. 칸의 마지막 블록, 비었으면 헤딩.
 
@@ -614,7 +653,67 @@ async def routine_today(date: str = "today") -> str:
             lines = [f"{day} 데일리루틴 ({rate}/{len(ITEMS)} 달성)"]
             lines.append("  했음: " + (", ".join(done) or "아직 없음"))
             lines.append("  남음: " + (", ".join(todo) or "없음 — 다 하셨어요"))
+            lines.append("  (칸에 적힌 글을 보려면 routine_read)")
             return "\n".join(lines)
+    except httpx.HTTPStatusError as e:
+        return f"노션 조회 중 오류 ({e.response.status_code}): {e.response.text[:200]}"
+    except Exception as e:  # noqa: BLE001
+        return context.as_message(e, "처리 중 예상치 못한 오류")
+
+
+@tool
+async def routine_read(section: str = "", date: str = "today") -> str:
+    """**노션** 데일리루틴 칸에 **적혀 있는 글을 읽는다** (아무것도 바꾸지 않는다).
+
+    "회고에 뭐라고 썼지?", "오늘 한 일 보여줘", "어제 뭐 적었더라" 처럼
+    **내용을 묻는 물음**에 이걸 쓴다. routine_today는 체크 여부만 알려줄 뿐
+    글자는 한 자도 돌려주지 않으니, 내용을 물으시면 반드시 이 도구를 써라.
+
+    ⚠️ **기억에 의존해 답하지 마라.** 앞 대화에서 네가 적어 드린 내용이 있어도,
+    그 뒤 아가씨가 노션에서 손으로 고치셨을 수 있다. 지금 무엇이 있는지는
+    이 도구만 안다.
+
+    Args:
+        section: 읽을 칸(헤딩) 이름. 비우면 글이 있는 칸을 전부 보여준다.
+            '회고'처럼 하위 칸을 거느린 이름을 주면 그 아래까지 같이 읽는다.
+        date: 대상 날짜 YYYY-MM-DD. 기본 'today' = 오늘.
+
+    Returns:
+        칸별로 적힌 글. 없으면 비어 있다고 알려준다.
+    """
+    day = _day_or_today(date)
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # ⚠️ _find_or_create_row가 아니라 _find_row다 — 읽기만 하는 도구가
+            #    "뭐 적었지?" 한 마디에 빈 행을 만들어 두면 안 된다.
+            row = await _find_row(client, day)
+            if row is None:
+                return f"{day} 데일리루틴 행이 아직 없어요. (그날 기록이 하나도 없다는 뜻)"
+
+            blocks = await _blocks_of(client, row["id"])
+            if section.strip():
+                lines = _section_lines(blocks, section)
+                if lines is None:
+                    found = ", ".join(t for t in map(_heading_text, blocks) if t)
+                    return f"'{section}' 칸을 못 찾았어요. 있는 칸: {found or '(하나도 없어요)'}"
+                if not lines:
+                    return f"{day} '{section}' 칸은 아직 비어 있어요."
+                return f"{day} '{section}'\n" + "\n".join(lines)
+
+            # 칸을 안 정하면 글이 든 칸만 훑어 보여준다 ("오늘 뭐 적었더라")
+            out: list[str] = []
+            for block in blocks:
+                name = _heading_text(block)
+                if not name or _level(block) != 2:  # 하위 칸은 위 칸에 딸려 나온다
+                    continue
+                lines = _section_lines(blocks, name) or []
+                if lines:
+                    out.append(f"[{name}]\n" + "\n".join(lines))
+            if not out:
+                return f"{day}에는 아직 적힌 글이 없어요. (체크 현황은 routine_today)"
+            text = "\n\n".join(out)
+            # 모델에 실릴 양을 묶어둔다 — 디스코드 2000자 제한도 있다
+            return text if len(text) <= 1500 else text[:1500] + "\n… (뒤는 줄였어요)"
     except httpx.HTTPStatusError as e:
         return f"노션 조회 중 오류 ({e.response.status_code}): {e.response.text[:200]}"
     except Exception as e:  # noqa: BLE001
@@ -793,7 +892,13 @@ async def routine_write(
 
 
 # agent.py가 가져다 쓰는 도구 목록
-ROUTINE_TOOLS = [routine_today, routine_check, routine_write, attach_routine_photo]
+ROUTINE_TOOLS = [
+    routine_today,
+    routine_read,
+    routine_check,
+    routine_write,
+    attach_routine_photo,
+]
 
 
 def _selftest() -> None:
@@ -941,6 +1046,47 @@ def _selftest() -> None:
     assert _append_anchor(section, "h-반성") == "p3"
     assert _append_anchor([], "h-반성") == "h-반성"  # 칸이 비어 있으면 헤딩 뒤
     assert isinstance(_append_anchor(section, "h-반성"), str)
+
+    # 읽기 도구 — 실제 노션 구조를 흉내 낸 블록으로 확인한다.
+    def _h(i, lv, t):
+        k = f"heading_{lv}"
+        return {"id": i, "type": k, k: {"rich_text": [{"plain_text": t}]}}
+
+    def _p(i, t):
+        return {"id": i, "type": "paragraph", "paragraph": {"rich_text": [{"plain_text": t}]}}
+
+    page = [
+        _h("h1", 2, "영어 스피킹"),
+        _p("p1", "30분 했다"),
+        _h("h2", 2, "운동"),
+        _h("h3", 2, "회고"),
+        _h("h4", 3, "오늘 한 일"),
+        _p("p2", "오전 3시간 49분"),
+        _p("p3", ""),
+        _h("h5", 3, "오늘의 특별한 점"),
+        {"id": "im", "type": "image", "image": {}},
+    ]
+    # ⚠️ '회고'(h2)는 자기 바로 밑이 비어 있고 글은 h3 아래에 있다. 다음 헤딩에서
+    #    멈추면 "회고에 뭐 써있어?"에 늘 '비어 있음'이 나온다 — 이걸 잡는 단언이다.
+    assert _section_lines(page, "회고") == [
+        "[오늘 한 일]", "오전 3시간 49분", "[오늘의 특별한 점]", "(사진)",
+    ], _section_lines(page, "회고")
+    # 같은 단계 헤딩을 만나면 멈춘다 (운동 칸까지 삼키면 안 된다)
+    assert _section_lines(page, "영어 스피킹") == ["30분 했다"]
+    # 이름표만 있고 내용이 없으면 빈 칸으로 본다
+    assert _section_lines(page, "운동") == []
+    assert _section_lines(page, "없는칸") is None
+    assert _norm("오늘 한 일") == _norm("오늘한일")  # 공백이 달라도 같은 칸
+
+    # 읽기 도구는 아무것도 바꾸면 안 된다 — 행을 만드는 함수를 부르지 않는다
+    import inspect
+
+    src = inspect.getsource(routine_read.coroutine)
+    assert "await _find_or_create_row" not in src, "읽기 도구가 행을 만든다"
+    assert "await _find_row(" in src
+    # 체크 현황만 주는 도구가 "내용은 저쪽"이라고 길을 알려줘야 한다. 안 그러면
+    # 모델이 routine_today 결과만 보고 기억으로 지어낸다 (2026-08-05에 실제로 그랬다).
+    assert "routine_read" in inspect.getsource(routine_today.coroutine)
 
     print("selftest OK")
 

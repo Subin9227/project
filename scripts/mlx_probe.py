@@ -1,7 +1,7 @@
-"""로컬 MLX 모델이 봇의 도구 17개를 제대로 고르는지 재보는 프로브. 읽기 전용.
+"""로컬 MLX 모델이 봇의 도구 18개를 제대로 고르는지 재보는 프로브. 읽기 전용.
 
 왜 필요한가:
-    12주차 실험에선 도구를 4개만 물려 4B가 성공했다. 봇의 실제 부하는 17개다.
+    12주차 실험에선 도구를 4개만 물려 4B가 성공했다. 봇의 실제 부하는 18개다.
     "도구가 많아지면 못 고른다"가 작은 모델의 대표 실패 모드라, 붙이기 전에 잰다.
 
 ⚠️ 도구를 **실행하지 않는다.** bind_tools + 1회 호출로 모델이 뱉은 tool_call만 본다.
@@ -41,6 +41,9 @@ CASES: list[tuple[str, tuple[str, ...]]] = [
     #    그래서 9B가 맞게 행동하고도 오답으로 세어졌다(2026-08-05).
     ("오전 작업 시작해줘", ("blaybus_start", "blaybus_list", "blaybus_status")),
     ("그만할래", ("blaybus_stop",)),
+    # 내용을 물으면 routine_today(체크 현황)가 아니라 routine_read여야 한다.
+    # 이걸 헷갈리면 모델이 기억으로 지어낸다 (2026-08-05).
+    ("오늘 회고에 뭐라고 썼지?", ("routine_read",)),
 ]
 
 
@@ -100,7 +103,7 @@ async def main() -> int:
     tools = build_tools()
     names = sorted(t.name for t in tools)
     print(f"도구 {len(tools)}개: {', '.join(names)}\n")
-    assert len(tools) == 17, f"도구 개수가 17이 아니다: {len(tools)}"
+    assert len(tools) == 18, f"도구 개수가 18이 아니다: {len(tools)}"
 
     # 도구 목록이 실제로 몇 글자나 실리는지 — 12주차 컨텍스트 문제의 크기를 눈으로 본다.
     # ⚠️ 둘 다 실제 페이로드에 맞춰야 한다.

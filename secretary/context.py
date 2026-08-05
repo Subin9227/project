@@ -92,11 +92,16 @@ def reset(token) -> None:
 
 def env_user() -> users.User:
     """.env 값으로 만든 가상의 사용자. 주인이 등록 없이 쓸 때의 설정."""
+    # ⚠️ 키도 provider를 따라가야 한다. 예전엔 늘 ANTHROPIC_API_KEY를 넣었는데,
+    #    agent가 vllm 분기에서 `llm_key or VLLM_API_KEY`로 읽어 **Anthropic 키를
+    #    로컬 서버에 Bearer로 보냈다** → 401. VLLM_API_KEY를 넣어도 소용이 없어
+    #    ".env가 안 먹는다"로 보였다 (2026-08-05).
+    local = bool(config.VLLM_BASE_URL)
     return users.User(
         discord_id=config.OWNER_ID or "env",
-        llm_provider="vllm" if config.VLLM_BASE_URL else "anthropic",
-        llm_key=config.ANTHROPIC_API_KEY,
-        llm_model=config.VLLM_MODEL if config.VLLM_BASE_URL else config.CLAUDE_MODEL,
+        llm_provider="vllm" if local else "anthropic",
+        llm_key=config.VLLM_API_KEY if local else config.ANTHROPIC_API_KEY,
+        llm_model=config.VLLM_MODEL if local else config.CLAUDE_MODEL,
         vllm_base_url=config.VLLM_BASE_URL,
         notion_token=config.NOTION_TOKEN,
         routine_ds_id=config.NOTION_ROUTINE_DS_ID,
@@ -119,6 +124,13 @@ def _selftest() -> None:
     assert active().discord_id == env_user().discord_id
     assert isinstance(active(), users.User)
     assert active().notion_token == config.NOTION_TOKEN
+
+    # ⚠️ 키가 provider를 따라가야 한다. 어긋나면 Anthropic 키가 로컬 서버로 나가 401.
+    me = env_user()
+    if config.VLLM_BASE_URL:
+        assert me.llm_provider == "vllm" and me.llm_key == config.VLLM_API_KEY
+    else:
+        assert me.llm_provider == "anthropic" and me.llm_key == config.ANTHROPIC_API_KEY
 
     # 조사가 받침을 따라가야 한다 ("블레이버스이(가)"는 어색하다)
     assert _subject_josa("블레이버스") == "가"

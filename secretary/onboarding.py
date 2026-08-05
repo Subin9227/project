@@ -17,7 +17,14 @@ import re
 
 import httpx
 
-from secretary.config import BLAYBUS_API_BASE, NOTION_API_BASE, NOTION_VERSION
+from secretary.config import (
+    BLAYBUS_API_BASE,
+    NOTION_API_BASE,
+    NOTION_VERSION,
+    VLLM_API_KEY,
+    VLLM_BASE_URL,
+    VLLM_MODEL,
+)
 
 # 노션 URL 어디에 있든 32자리 hex(대시 없는 UUID)를 집어낸다.
 _UUID32 = re.compile(r"[0-9a-fA-F]{32}")
@@ -113,7 +120,13 @@ def pick_databases(found: list[dict]) -> tuple[str | None, str | None]:
 
 
 # 제공자별 기본 모델. /setup으로 바꾸기 전까지 이 값이 쓰인다.
-DEFAULT_MODEL = {"anthropic": "claude-sonnet-4-5", "openai": "gpt-4o-mini"}
+# ⚠️ vllm 자리를 비워두면 아래 `or "x"`가 걸려 **'x' 모델을 못 찾았어요**로 등록이 막힌다.
+#    직접 띄운 서버는 모델 이름이 사람마다 다르므로 .env 값을 기본으로 쓴다.
+DEFAULT_MODEL = {
+    "anthropic": "claude-sonnet-4-5",
+    "openai": "gpt-4o-mini",
+    "vllm": VLLM_MODEL,
+}
 
 
 async def verify_llm(provider: str, secret: str, model: str | None = None) -> str | None:
@@ -141,8 +154,15 @@ async def verify_llm(provider: str, secret: str, model: str | None = None) -> st
         else:  # vllm — secret이 키가 아니라 서버 주소다
             from langchain_openai import ChatOpenAI
 
+            # ⚠️ 키를 "not-needed"로 박으면 인증을 거는 서버에서 무조건 401이다.
+            #    optiq serve는 'sk-optiq-'로 시작하는 Bearer만 받는다 — 실제로 대화할 때
+            #    쓰는 값(.env의 VLLM_API_KEY)으로 확인해야 검증이 의미가 있다.
+            # 주소를 안 주면 봇의 기본 서버로 확인한다 (agent도 같은 순서로 고른다).
+            base = secret or VLLM_BASE_URL
+            if not base:
+                return "쓸 수 있는 vLLM 서버가 없어요. 주소를 넣거나 관리자에게 문의해 주세요."
             llm = ChatOpenAI(
-                model=name_wanted, base_url=secret, api_key="not-needed", max_tokens=1
+                model=name_wanted, base_url=base, api_key=VLLM_API_KEY, max_tokens=1
             )
         await llm.ainvoke("hi")
     except Exception as e:  # noqa: BLE001
@@ -226,7 +246,9 @@ def _selftest() -> None:
     msg = asyncio.run(verify_llm("vllm", "http://127.0.0.1:9"))
     assert isinstance(msg, str) and "못 붙었어요" in msg, msg
     # 기본 모델은 여기가 단일 출처다 (commands·agent가 이 값을 가져다 쓴다)
-    assert set(DEFAULT_MODEL) == {"anthropic", "openai"}  # vllm은 서버가 모델을 정한다
+    # ⚠️ PROVIDERS 셋이 모두 있어야 한다. vllm을 빼뒀더니 verify_llm이 `or "x"`로 떨어져
+    #    "'x' 모델을 못 찾았어요"로 등록이 막혔다 (2026-08-05).
+    assert set(DEFAULT_MODEL) == {"anthropic", "openai", "vllm"}, DEFAULT_MODEL
     assert all(isinstance(v, str) and v for v in DEFAULT_MODEL.values())
     print("selftest OK")
 

@@ -20,6 +20,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from secretary import config
 from secretary.config import CRED_KEY, KST, USERS_DB_PATH
 
 # 비밀로 다뤄 저장 시 암호화하는 칸.
@@ -118,8 +119,15 @@ class User:
 
     @property
     def registered(self) -> bool:
-        """봇을 쓸 수 있는 상태인가. 뇌가 없으면 아무것도 못 한다."""
-        return bool(self.llm_provider and (self.llm_key or self.vllm_base_url))
+        """봇을 쓸 수 있는 상태인가. 뇌가 없으면 아무것도 못 한다.
+
+        ⚠️ vllm은 주소를 비워도 등록으로 본다 — 봇이 쓰는 기본 서버(.env)를 따라가기
+           때문이다. 다만 **provider가 vllm일 때만** 연다. 조건을 넓게 풀면 아무것도
+           안 넣은 사람이 관문을 통과한다.
+        """
+        if self.llm_provider == "vllm":
+            return bool(self.vllm_base_url or config.VLLM_BASE_URL)
+        return bool(self.llm_provider and self.llm_key)
 
 
 def _connect() -> sqlite3.Connection:
@@ -266,7 +274,22 @@ def _selftest() -> None:
     save("2", llm_provider="vllm", vllm_base_url="http://x")
     assert get("2").registered is True
 
-    assert len(all_users()) == 2
+    # ⚠️ vLLM은 주소를 비워도 봇의 기본 서버(.env)를 따라간다. 다만 관문이 넓어지면
+    #    안 되므로 provider가 vllm일 때만 열린다.
+    save("2", vllm_base_url=None)
+    assert get("2").registered is bool(config.VLLM_BASE_URL)
+    save("2", llm_provider="openai")
+    assert get("2").registered is False, "키 없는 openai가 관문을 통과했다"
+
+    # ⚠️ provider를 바꾸면 반대편 칸이 비워져야 한다. 안 그러면 옛 OpenAI 키가 남아
+    #    로컬 서버로 나가 401이 난다 (2026-08-05에 실제로 겪음).
+    save("3", llm_provider="openai", llm_key="sk-old", llm_model="gpt-4o-mini")
+    save("3", llm_provider="vllm", vllm_base_url="http://y", llm_key=None, llm_model=None)
+    v = get("3")
+    assert v.llm_key is None and v.llm_model is None, (v.llm_key, v.llm_model)
+    assert v.registered is True
+
+    assert len(all_users()) == 3
     assert isinstance(all_users()[0], User)
 
     # 알림 끄기는 받을 곳을 지우지 않는다 — 지우면 다시 켤 때 채널 ID를 또 찾아야 한다
@@ -297,7 +320,9 @@ def _selftest() -> None:
     old_key = CRED_KEY
     CRED_KEY = Fernet.generate_key().decode()  # type: ignore[assignment]
     assert get("1") is None, "못 푸는데 User를 돌려줬다"
-    assert all_users() == [], "못 푸는 행이 목록에 남았다"
+    # 비밀이 든 행만 빠진다. "3"은 vLLM이라 암호화된 칸이 하나도 없어 그대로 읽힌다
+    # — 키 없이 쓰는 사람은 CRED_KEY가 바뀌어도 영향을 안 받는다.
+    assert [u.discord_id for u in all_users()] == ["3"], all_users()
     CRED_KEY = old_key  # type: ignore[assignment]
     assert get("1") is not None, "열쇠를 되돌렸는데 못 읽는다"
 

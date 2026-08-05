@@ -46,13 +46,17 @@ class RegisterModal(discord.ui.Modal):
         super().__init__(title=f"공주비서 등록 ({provider})")
         self.provider = provider
 
-        secret_label = "vLLM 서버 주소" if provider == "vllm" else "LLM API 키"
+        # vLLM은 주소를 비워도 된다 — 비우면 봇이 쓰는 기본 서버(.env)를 따라간다.
+        # 주소를 사람마다 저장해두면 서버를 옮길 때 등록자 전원의 행을 고쳐야 한다.
+        local = provider == "vllm"
         self.llm = discord.ui.TextInput(
-            label=secret_label,
+            label="vLLM 서버 주소 (비우면 기본 서버)" if local else "LLM API 키",
             placeholder=(
-                "http://... (내 vLLM)" if provider == "vllm" else "sk-... (본인 키)"
+                "비워두셔도 돼요. 직접 띄운 서버가 있으면 http://..."
+                if local
+                else "sk-... (본인 키)"
             ),
-            required=True,
+            required=not local,
         )
         self.notion_token = discord.ui.TextInput(
             label="노션 통합 토큰",
@@ -95,12 +99,21 @@ class RegisterModal(discord.ui.Modal):
         if llm_error:
             report.append(f"❌ 뇌({self.provider}): {llm_error}")
         else:
+            # ⚠️ provider를 바꿔 다시 등록하면 **반대편 칸을 반드시 비워야** 한다.
+            #    예전엔 vllm 분기가 vllm_base_url만 넣어서, openai로 등록했던 사람의
+            #    옛 키와 'gpt-4o-mini'가 그대로 남았다. agent가 `llm_key or VLLM_API_KEY`로
+            #    읽으니 **OpenAI 키가 로컬 서버로 나가 401** — /forget 말고는 길이 없었다
+            #    (2026-08-05). '준 것만 갱신'이라 None을 넣어 지워야 한다.
             fields["llm_provider"] = self.provider
             if self.provider == "vllm":
-                fields["vllm_base_url"] = secret
+                # 빈 주소는 저장하지 않는다 → agent가 .env의 VLLM_BASE_URL을 쓴다
+                fields["vllm_base_url"] = secret or None
+                fields["llm_key"] = None
+                fields["llm_model"] = None  # .env의 VLLM_MODEL을 따른다
             else:
                 fields["llm_key"] = secret
                 fields["llm_model"] = _DEFAULT_MODEL[self.provider]
+                fields["vllm_base_url"] = None
             report.append(f"✅ 뇌: {self.provider}")
 
         # 노션 — 페이지 하나에서 DB들을 찾아낸다
@@ -435,7 +448,8 @@ def _selftest() -> None:
     # 앞 4자만 남고 나머지는 안 보여야 한다
     assert masked.startswith("sk-a") and "efghij" not in masked
     assert isinstance(masked, str)
-    assert set(_DEFAULT_MODEL) == {"anthropic", "openai"}  # vllm은 모델을 서버가 정한다
+    # 고를 수 있는 provider마다 기본 모델이 있어야 한다 (없으면 검증이 'x'로 떨어진다)
+    assert {c.value for c in PROVIDERS} == set(_DEFAULT_MODEL), _DEFAULT_MODEL
     assert len(PROVIDERS) == 3
     # 고지 문장이 비어 있으면 안 된다 — 이게 이 단계의 산출물이다
     assert "비밀번호" in WARNING and "/forget" in WARNING

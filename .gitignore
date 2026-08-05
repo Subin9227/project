@@ -17,3 +17,5 @@ data/
 *.pcap
 reports/captures/*
 !reports/captures/.gitkeep
+
+debate

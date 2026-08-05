@@ -17,6 +17,15 @@
 
 아젠다 > 워크 > 태스크 3계층이고, 타이머는 태스크에만 있다.
 
+오류를 다루는 방식 (2026-08-04):
+    서버는 거절할 때 **한국어로 이유를 정확히** 준다. raise_for_status()는 그 본문을
+    버리므로, _request()가 통과 지점 한 곳에서 BlaybusError(message, code, data)로
+    바꿔 던진다. 부르는 쪽 13곳에서 각자 버리던 것을 한 곳으로 모은 것이다.
+    ⚠️ 태스크당 4시간(240분) 상한을 넘기면 그냥 거절하지 않고 STOP_SPLIT_REQUIRED와
+       함께 **분할안(parts)까지 계산해서** 준다. 그 index를 {"selectedParts":[1,2]}로
+       되돌려주면 저장된다. 조각 시간을 우리가 계산하면 서버와 어긋나므로 하지 않는다.
+       분할하면 태스크가 '오전 (1/2)', '오전 (2/2)'로 쪼개진다 — 이름이 겹치는 원인.
+
 도구 9개:
     blaybus_status()            지금 뭐가 돌고 있나
     blaybus_start(...)          이름으로 태스크를 찾아 시간기록 시작
@@ -89,13 +98,57 @@ def _project_id() -> str:
     return context.require(context.active().blaybus_pid, "블레이버스")
 
 
+class BlaybusError(context.UserFacing):
+    """서버가 요청을 거절했다. 메시지는 서버가 준 한국어 사유 그대로.
+
+    ⚠️ 이 클래스가 생긴 이유: 예전엔 raise_for_status()가 응답 **본문을 버렸다.**
+       그래서 아가씨는 "400 에러를 내면서 거부하고 있어요"만 보고 뭘 해야 할지
+       알 수 없었다. 정작 서버는 "태스크 최대 기록 시간(240분)을 초과합니다.
+       분할 선택이 필요합니다"라고 한국어로 정확히 알려주고 있었다.
+    """
+
+    def __init__(self, message: str, code: str | None = None, data=None):
+        super().__init__(message)
+        self.code = code  # 'STOP_SPLIT_REQUIRED'처럼 분기가 필요한 경우를 위해
+        # 거절과 함께 오는 부가 정보. STOP_SPLIT_REQUIRED는 여기에 분할안(parts)을
+        # 담아준다 — 우리가 시간을 계산하지 않고 서버가 준 것을 그대로 되돌려준다.
+        self.data = data
+
+
+def _server_message(resp: httpx.Response) -> tuple[str, str | None, object]:
+    """오류 응답에서 (사람이 읽을 사유, code, data)를 뽑는다. JSON이 아니면 본문 앞부분.
+
+    ⚠️ message가 문자열이 아니라 리스트로 오는 경우가 있다
+       (DTO 검증 실패: ["property parts should not exist"]).
+    """
+    try:
+        body = resp.json()
+    except Exception:  # noqa: BLE001 - HTML 오류 페이지 등
+        return (resp.text or "").strip()[:200] or f"HTTP {resp.status_code}", None, None
+
+    if not isinstance(body, dict):
+        return f"HTTP {resp.status_code}", None, None
+    message = body.get("message")
+    if isinstance(message, list):
+        message = ", ".join(str(m) for m in message)
+    return str(message or f"HTTP {resp.status_code}"), body.get("code"), body.get("data")
+
+
+def _check(resp: httpx.Response, prefix: str = "") -> httpx.Response:
+    """오류면 서버가 준 사유를 실어 던진다. 성공이면 그대로 돌려준다."""
+    if resp.is_error:
+        message, code, data = _server_message(resp)
+        raise BlaybusError(f"{prefix}{message}", code, data)
+    return resp
+
+
 async def _login(client: httpx.AsyncClient, login_id: str, password: str) -> None:
     resp = await client.post(
         "/auth/user/sign-in",
         json={"loginId": login_id, "password": password},
         headers=_ORIGIN_HEADERS,
     )
-    resp.raise_for_status()  # 쿠키 3종은 client.cookies에 자동 저장된다
+    _check(resp, "블레이버스 로그인이 거부됐어요: ")  # 쿠키 3종은 자동 저장된다
 
 
 async def _request(method: str, path: str, **kwargs) -> httpx.Response:
@@ -105,6 +158,9 @@ async def _request(method: str, path: str, **kwargs) -> httpx.Response:
     오는데, 그때 무한 재로그인하면 계정 잠금을 스스로 부른다.
     ⚠️ 이제 남의 계정도 다루므로 이 규칙이 더 중요하다 — 되풀이하면 남의 계정을
        잠근다.
+
+    오류는 여기서 BlaybusError로 던진다. 부르는 쪽마다 raise_for_status()를 하면
+    서버가 준 사유를 13곳에서 각자 버리게 되므로, 통과 지점 한 곳에서 처리한다.
     """
     key, login_id, password = _creds()
     context.require(login_id and password, "블레이버스")
@@ -126,7 +182,7 @@ async def _request(method: str, path: str, **kwargs) -> httpx.Response:
         async with _locks[key]:
             await _login(client, login_id, password)
         resp = await client.request(method, path, headers=_headers(), **kwargs)
-    return resp
+    return _check(resp)
 
 
 def _norm(text: str) -> str:
@@ -181,14 +237,12 @@ async def _tree() -> list[dict]:
     resp = await _request(
         "GET", f"/project/{_project_id()}/agenda?completed=true&page=1&pageSize=100"
     )
-    resp.raise_for_status()
     return resp.json()["data"]["list"]
 
 
 async def _my_id() -> int:
     """태스크 생성에 필요한 assignee. 계정이 바뀌면 조용히 남의 태스크를 만들게 되므로 박아두지 않는다."""
     resp = await _request("GET", "/auth/user/info")
-    resp.raise_for_status()
     return resp.json()["data"]["id"]
 
 
@@ -289,7 +343,6 @@ async def blaybus_status() -> str:
     """
     try:
         resp = await _request("GET", "/task-session/active")
-        resp.raise_for_status()
         sessions = resp.json()["data"]["list"]
     except Exception as e:  # noqa: BLE001 - 도구는 예외를 문자열로 돌려줘야 전달된다
         return context.as_message(e, "블레이버스 상태를 못 봤어요")
@@ -332,8 +385,9 @@ async def blaybus_start(
     if err:
         return err
 
-    # 트리를 쓰는 이유: /project/{pid}/task는 평평한 목록이라 소속을 알 수 없다.
-    # 되물을 때 '13주차 > 수요일'을 보여주려면 경로가 있어야 한다.
+    # 트리를 쓰는 이유: 되물을 때 '13주차 > 수요일'을 보여주려면 경로가 있어야 한다.
+    # (/project/{pid}/task?agendaId=&workId= 로 좁힐 수는 있지만, 그건 id를 이미
+    #  알 때 얘기다. 우리는 이름만 받으므로 어차피 트리를 한 번 훑어야 한다.)
     triples = _walk(tree)
     if work_title:
         want = _norm(work_title)
@@ -372,25 +426,108 @@ async def blaybus_start(
     agenda, work, task = hits[0]
     try:
         resp = await _request("POST", f"/task/{task['id']}/session/start")
-        resp.raise_for_status()
     except Exception as e:  # noqa: BLE001
         return context.as_message(e, f"'{task['title']}' 시작에 실패했어요")
     return f"'{_describe(agenda, work)} > {task['title']}' 시간기록을 시작했어요."
 
 
+def _unique_title(existing: list[str], title: str) -> str:
+    """같은 이름이 이미 있으면 '오전 (2)', '오전 (3)'으로 비켜준다.
+
+    ⚠️ 블레이버스는 멈춘 타이머를 이어서 못 켠다. 그래서 같은 일을 다시 하려면
+       같은 이름의 태스크를 또 만들 수밖에 없는데, 그러면 나중에 '오전'이 열 개가
+       되어 무엇을 시작/중지할지 특정할 수 없다(2026-08-04·05 실제 사고).
+       서버가 분할하며 붙이는 '(1/3)'과는 모양이 달라 섞이지 않는다.
+    """
+    taken = {_norm(t) for t in existing}
+    if _norm(title) not in taken:
+        return title
+    n = 2
+    while _norm(f"{title} ({n})") in taken:
+        n += 1
+    return f"{title} ({n})"
+
+
+def _split_parts(data) -> list[dict]:
+    """거절 응답에서 서버가 계산해 준 분할안을 꺼낸다. 없으면 빈 목록."""
+    parts = (data or {}).get("parts") if isinstance(data, dict) else None
+    return [p for p in (parts or []) if isinstance(p, dict) and "index" in p]
+
+
+def _describe_parts(parts: list[dict]) -> str:
+    """'240분 + 62분' 처럼 사람이 읽을 분할 모양."""
+    return " + ".join(_duration(int(p.get("durationMinutes") or 0) * 60) for p in parts)
+
+
+def _session_path(s: dict) -> str:
+    """되물을 때 보여줄 세션 경로. '수요일 > 오전'"""
+    return f"{s.get('workTitle') or '(워크 없음)'} > {s['taskTitle']}"
+
+
+def _pick_sessions(
+    sessions: list[dict], task_title: str | None, work_title: str | None
+) -> tuple[list[dict], str | None]:
+    """멈출 세션을 고른다. 못 고르면 (,, 사용자에게 그대로 돌려줄 문장).
+
+    ⚠️ 이름은 유일하지 않다. '오전'이 두 워크에서 동시에 돌 수 있으므로,
+       하나로 못 좁히면 멈추지 말고 되묻는다 — 블레이버스엔 삭제가 없어서
+       잘못 멈춘 건 되돌릴 수 없다(멈춤 = 완료 처리).
+    """
+    hits = sessions
+    if work_title:
+        want = _norm(work_title)
+        exact = [s for s in hits if _norm(s.get("workTitle") or "") == want]
+        hits = exact or [s for s in hits if want in _norm(s.get("workTitle") or "")]
+    if task_title:
+        want = _norm(task_title)
+        exact = [s for s in hits if _norm(s["taskTitle"]) == want]
+        hits = exact or [s for s in hits if want in _norm(s["taskTitle"])]
+
+    running = ", ".join(f"'{_session_path(s)}'" for s in sessions)
+    if not hits:
+        return [], f"'{task_title or work_title}'는 지금 돌고 있지 않아요. 돌고 있는 것: {running}"
+    if len(hits) > 1:
+        names = ", ".join(f"'{_session_path(s)}' ({_duration(s['elapsedSeconds'])})" for s in hits)
+        return [], (
+            f"멈출 게 여럿이에요: {names}. 어느 것인지 알려주시면 그것만 멈출게요. "
+            "전부 멈추려면 그렇게 말씀해 주세요."
+        )
+    return hits, None
+
+
 @tool
-async def blaybus_stop() -> str:
+async def blaybus_stop(
+    task_title: str | None = None,
+    work_title: str | None = None,
+    all_running: bool = False,
+    confirm_split: bool = False,
+) -> str:
     """블레이버스에서 돌아가고 있는 시간기록을 멈춘다.
 
     "블레이버스 꺼줘", "퇴근", "그만 기록해" 같은 요청에 쓴다.
-    무엇이 돌고 있는지는 알아서 찾으므로 인자가 필요 없다.
+
+    ⚠️ 블레이버스는 타이머를 **동시에 여러 개** 켤 수 있다. 그래서 무엇을 멈출지가
+    중요하다 — 멈춤은 곧 완료 처리이고, 블레이버스엔 삭제도 이어하기도 없다.
+    아가씨가 특정 태스크를 지목하시면(예: "오전 꺼줘", 목록의 "첫번째") 반드시
+    **task_title을 채워서 불러라.** 비워두고 부르면, 하나만 돌 때는 그것을 멈추지만
+    여럿이 돌면 아무것도 안 멈추고 목록을 돌려준다.
+    "다 꺼줘"처럼 **전부를 분명히 원하실 때만 all_running=true**로 불러라.
+
+    ⚠️ 태스크당 4시간이 상한이라, 넘겨서 켜둔 경우엔 여러 조각으로 나눠 저장해야
+    한다. 그때 이 도구가 "이렇게 나눠 저장할까요?"라고 되돌려주니, 아가씨께
+    여쭙고 **그렇다고 하시면 confirm_split=true로 다시 불러라.**
+
+    Args:
+        task_title: 멈출 태스크 제목 (예: '오전'). 지목하셨으면 반드시 채운다.
+        work_title: 그 태스크가 속한 워크 (예: '수요일'). 같은 이름이 여럿일 때 좁힌다.
+        all_running: 돌고 있는 것을 **전부** 멈춘다. "다 꺼줘"라고 하셨을 때만 true.
+        confirm_split: 4시간을 넘긴 기록을 나눠 저장해도 된다고 확인받았을 때만 true.
 
     Returns:
         처리 결과 문자열.
     """
     try:
         resp = await _request("GET", "/task-session/active")
-        resp.raise_for_status()
         sessions = resp.json()["data"]["list"]
     except Exception as e:  # noqa: BLE001
         return context.as_message(e, "블레이버스 상태를 못 봤어요")
@@ -398,14 +535,51 @@ async def blaybus_stop() -> str:
     if not sessions:
         return "지금 돌아가는 시간기록이 없어요. 멈출 게 없네요."
 
+    if not all_running:
+        sessions, err = _pick_sessions(sessions, task_title, work_title)
+        if err:
+            return err
+
     stopped = []
     for s in sessions:
+        path = f"/task/{s['taskId']}/session/stop"
         try:
-            resp = await _request("POST", f"/task/{s['taskId']}/session/stop")
-            resp.raise_for_status()
+            await _request("POST", path)
             stopped.append(f"'{s['taskTitle']}' ({_duration(s['elapsedSeconds'])})")
+        except BlaybusError as e:
+            # ⚠️ 태스크당 4시간이 상한이라, 넘기면 서버가 그냥 거절하지 않고
+            #    "이렇게 나눠 저장할래?"라며 분할안(parts)까지 계산해 준다.
+            #    조각 시간을 우리가 계산하지 않는다 — 서버가 준 index만 되돌려준다.
+            if e.code != "STOP_SPLIT_REQUIRED":
+                return context.as_message(e, f"'{s['taskTitle']}' 중지에 실패했어요")
+
+            parts = _split_parts(e.data)
+            if not parts:  # 분할안을 못 읽으면 지어내지 말고 사유를 그대로 전한다
+                return context.as_message(e, f"'{s['taskTitle']}' 중지에 실패했어요")
+
+            if not confirm_split:
+                # ⚠️ 쪼개진 뒤 이름('오전 (1/2)')을 미리 보여줬더니, 모델이 그걸 할 일로
+                #    읽고 그 이름의 태스크를 찾아 시작하려 들었다(2026-08-04 실사용자).
+                #    없으니 새로 만들자고까지 했다 — 이름은 빼고 조각 수만 말한다.
+                return (
+                    # _duration은 항상 '분'으로 끝나 받침이 있으므로 '이라'로 고정
+                    f"'{s['taskTitle']}' 태스크가 {_duration(s['elapsedSeconds'])}이라 "
+                    f"블레이버스 상한(4시간)을 넘었어요. {_describe_parts(parts)}, "
+                    f"{len(parts)}조각으로 나눠서 저장해야 해요. 그렇게 할까요? "
+                    "(저장한 뒤엔 웹에서 손으로만 고칠 수 있어요)"
+                )
+
+            try:
+                await _request(
+                    "POST", path, json={"selectedParts": [p["index"] for p in parts]}
+                )
+            except Exception as e2:  # noqa: BLE001
+                return context.as_message(e2, f"'{s['taskTitle']}' 분할 저장에 실패했어요")
+            stopped.append(
+                f"'{s['taskTitle']}' ({_describe_parts(parts)}, {len(parts)}조각으로 나눠 저장)"
+            )
         except Exception as e:  # noqa: BLE001
-            return context.as_message(e, "'{s['taskTitle']}' 중지에 실패했어요")
+            return context.as_message(e, f"'{s['taskTitle']}' 중지에 실패했어요")
     return f"블레이버스 시간기록을 멈췄어요: {', '.join(stopped)}"
 
 
@@ -470,9 +644,8 @@ async def blaybus_add_agenda(title: str) -> str:
         resp = await _request(
             "POST", f"/project/{_project_id()}/agenda", json={"title": title}
         )
-        resp.raise_for_status()
     except Exception as e:  # noqa: BLE001
-        return context.as_message(e, "아젠다 '{title}' 생성에 실패했어요")
+        return context.as_message(e, f"아젠다 '{title}' 생성에 실패했어요")
     return f"블레이버스에 아젠다 '{title}'를 만들었어요."
 
 
@@ -499,16 +672,17 @@ async def blaybus_add_work(work_title: str, agenda_title: str, date: str | None 
     if err:
         return err
 
+    title = _unique_title([w["title"] for w in (agenda.get("works") or [])], work_title)
     try:
         resp = await _request(
             "POST",
             f"/project/{_project_id()}/agenda/{agenda['id']}/work",
-            json={"title": work_title, "date": _due(date)},
+            json={"title": title, "date": _due(date)},
         )
-        resp.raise_for_status()
     except Exception as e:  # noqa: BLE001
-        return context.as_message(e, "워크 '{work_title}' 생성에 실패했어요")
-    return f"아젠다 '{agenda['title']}'에 워크 '{work_title}'를 만들었어요."
+        return context.as_message(e, f"워크 '{work_title}' 생성에 실패했어요")
+    renamed = f" (같은 이름이 있어서 '{title}'로 만들었어요)" if title != work_title else ""
+    return f"아젠다 '{agenda['title']}'에 워크 '{title}'를 만들었어요.{renamed}"
 
 
 @tool
@@ -565,22 +739,25 @@ async def blaybus_add_task(
         names = ", ".join(f"'{_describe(a, w)}'" for a, w in works[:10]) or "(워크가 없어요)"
         return f"어느 워크에 넣을까요? 있는 워크: {names}"
 
+    # 같은 워크에 같은 이름이 있으면 '오전 (2)'로 비켜준다. 멈춘 타이머를 이어서
+    # 못 켜는 구조라 같은 이름이 계속 쌓이는데, 그러면 무엇을 시작/중지할지 못 고른다.
+    title = _unique_title([t["title"] for t in (work.get("tasks") or [])], task_title)
     try:
         resp = await _request(
             "POST",
             f"/project/{_project_id()}/task",
             json={
-                "title": task_title,
+                "title": title,
                 "assignee": assignee,
                 "agendaId": agenda["id"],
                 "workId": work["id"],
                 "position": None,
             },
         )
-        resp.raise_for_status()
     except Exception as e:  # noqa: BLE001
         return context.as_message(e, f"태스크 '{task_title}' 생성에 실패했어요")
-    return f"'{_describe(agenda, work)}'에 태스크 '{task_title}'를 만들었어요."
+    renamed = f" (같은 이름이 있어서 '{title}'로 만들었어요)" if title != task_title else ""
+    return f"'{_describe(agenda, work)}'에 태스크 '{title}'를 만들었어요.{renamed}"
 
 
 @tool
@@ -660,7 +837,6 @@ async def blaybus_rename(
     path = _RENAME_PATHS[found_kind].format(pid=_project_id(), id=item["id"])
     try:
         resp = await _request("POST", path, json={"title": new_title})
-        resp.raise_for_status()
     except Exception as e:  # noqa: BLE001
         return context.as_message(e, "이름 변경에 실패했어요")
     return f"{_KIND_KR[found_kind]} '{item['title']}'를 '{new_title}'로 바꿨어요."
@@ -698,7 +874,6 @@ async def blaybus_today_tasks(date: str = "today") -> str:
         resp = await _request(
             "GET", f"/task/calendar/user?from={day}&to={day}&userId={uid}"
         )
-        resp.raise_for_status()
         # ⚠️ source로 반드시 거른다. 'upcoming'(미완료)은 duration이 없는 채로
         #    조회 날짜와 무관하게 딸려 나온다 — 안 거르면 남의 날 일이 섞인다.
         done = [t for t in resp.json()["data"]["list"] if t.get("source") == "completed"]
@@ -709,7 +884,6 @@ async def blaybus_today_tasks(date: str = "today") -> str:
         running = []
         if day == today:
             active = await _request("GET", "/task-session/active")
-            active.raise_for_status()
             running = active.json()["data"]["list"]
     except Exception as e:  # noqa: BLE001
         return context.as_message(e, "블레이버스 조회 중 오류")
@@ -844,6 +1018,167 @@ def _selftest() -> None:
 
     assert _due("2026-08-07").startswith("2026-08-07T") and _due(None).endswith("Z")
     assert set(_RENAME_PATHS) == {"agenda", "work", "task"}
+
+    # --- 서버가 준 사유를 버리지 않는가 (2026-08-04 실측 응답 그대로) -----------
+    # 예전엔 raise_for_status()가 본문을 버려서 "400 에러"만 남았다.
+    split = httpx.Response(
+        400,
+        json={
+            "message": "프로젝트의 태스크 최대 기록 시간(240분)을 초과합니다. 분할 선택이 필요합니다.",
+            "code": "STOP_SPLIT_REQUIRED",
+            "data": {"capMinutes": 240, "currentMinutes": 302},
+        },
+    )
+    message, code, data = _server_message(split)
+    assert "240분" in message and code == "STOP_SPLIT_REQUIRED", (message, code)
+    assert data["currentMinutes"] == 302
+
+    # message가 리스트로 오는 경우(DTO 검증 실패)도 문장으로 합쳐야 한다
+    listy = httpx.Response(400, json={"message": ["property parts should not exist"], "code": "002"})
+    assert _server_message(listy)[0] == "property parts should not exist"
+
+    # JSON이 아니면(HTML 오류 페이지 등) 터지지 말고 본문 앞부분을 준다
+    assert "HTTP 502" in _server_message(httpx.Response(502, text=""))[0]
+    assert _server_message(httpx.Response(500, text="<html>oops</html>"))[0] == "<html>oops</html>"
+
+    # _check: 성공은 그대로 통과, 실패는 BlaybusError로 던진다
+    ok = httpx.Response(200, json={"data": {}})
+    assert _check(ok) is ok
+    try:
+        _check(split)
+        raise AssertionError("400인데 통과했다")
+    except BlaybusError as e:
+        assert e.code == "STOP_SPLIT_REQUIRED"
+        # ⚠️ 예외 타입 이름이 아가씨께 새면 안 된다 — UserFacing이라 그대로 나가야 한다
+        shown = context.as_message(e, "중지에 실패했어요")
+        assert shown.startswith("프로젝트의 태스크") and "BlaybusError" not in shown, shown
+    # 로그인 실패는 접두사가 붙는다 (어느 단계에서 막혔는지 알아야 한다)
+    try:
+        _check(httpx.Response(401, json={"message": "비밀번호가 틀렸습니다"}), "블레이버스 로그인이 거부됐어요: ")
+        raise AssertionError("401인데 통과했다")
+    except BlaybusError as e:
+        assert str(e) == "블레이버스 로그인이 거부됐어요: 비밀번호가 틀렸습니다"
+
+    # --- 분할 저장 (2026-08-04 웹앱 cURL: {"selectedParts":[1,2]}) --------------
+    # ⚠️ 조각 시간을 우리가 계산하면 서버와 어긋난다. index만 되돌려주는지 본다.
+    real_parts = [
+        {"index": 1, "startAt": "2026-08-04T00:15:26.000Z", "durationMinutes": 240},
+        {"index": 2, "startAt": "2026-08-04T04:15:26.000Z", "durationMinutes": 62},
+    ]
+    parts = _split_parts({"capMinutes": 240, "currentMinutes": 302, "parts": real_parts})
+    assert [p["index"] for p in parts] == [1, 2]
+    assert _describe_parts(parts) == "4시간 0분 + 1시간 2분", _describe_parts(parts)
+
+    # 분할안이 없거나 모양이 다르면 빈 목록 — 지어내지 않는다 (없으면 사유를 그대로 전한다)
+    assert _split_parts(None) == [] and _split_parts({}) == []
+    assert _split_parts({"parts": None}) == []
+    assert _split_parts({"parts": [{"noIndex": 1}]}) == []
+    assert isinstance(_split_parts({"parts": real_parts}), list)
+
+    # 확인 전에는 저장하면 안 된다 — 모델이 보는 스키마에서 기본값이 False여야
+    # 그냥 "멈춰줘"에 한 번 여쭙는 단계를 거친다.
+    props = blaybus_stop.args_schema.model_json_schema()["properties"]
+    assert props["confirm_split"].get("default") is False, props
+    # 전부 끄기도 기본값이 False여야 한다. 되돌릴 수 없는 동작이 기본이면 안 된다.
+    assert props["all_running"].get("default") is False, props
+
+    # --- 같은 이름이 쌓이는 것 막기 ('오전' → '오전 (2)') ---------------------
+    assert _unique_title([], "오전") == "오전"
+    assert _unique_title(["오후"], "오전") == "오전"
+    assert _unique_title(["오전"], "오전") == "오전 (2)"
+    assert _unique_title(["오전", "오전 (2)"], "오전") == "오전 (3)"
+    assert _unique_title(["오전", "오전 (3)"], "오전") == "오전 (2)"  # 빈 번호를 먼저 쓴다
+    assert _unique_title(["오전(2)"], "오전 (2)") == "오전 (2) (2)"  # 공백 무시해 같은 이름으로 본다
+    # 서버가 분할하며 붙이는 '(1/3)'과는 모양이 달라 섞이지 않는다
+    assert _unique_title(["오전 (1/3)"], "오전") == "오전"
+    assert isinstance(_unique_title(["오전"], "오전"), str)
+
+    # --- 여러 개가 돌 때 무엇을 멈출지 (2026-08-05: 하나만 끄랬는데 둘 다 껐다) ---
+    two = [
+        {"taskId": 1, "taskTitle": "4시간 이상 테스트", "workTitle": "8월4일 테스트", "elapsedSeconds": 43020},
+        {"taskId": 2, "taskTitle": "오전", "workTitle": "수요일", "elapsedSeconds": 60},
+    ]
+    # 지목 없이 여럿 → 아무것도 안 고르고 되묻는다
+    picked, err = _pick_sessions(two, None, None)
+    assert picked == [] and "여럿이에요" in err, (picked, err)
+    assert "8월4일 테스트 > 4시간 이상 테스트" in err and "수요일 > 오전" in err, err
+    # 이름을 주면 그것만
+    picked, err = _pick_sessions(two, "오전", None)
+    assert err is None and [s["taskId"] for s in picked] == [2], (picked, err)
+    picked, err = _pick_sessions(two, "4시간 이상 테스트", None)
+    assert err is None and [s["taskId"] for s in picked] == [1], (picked, err)
+    # 워크로도 좁혀진다
+    picked, err = _pick_sessions(two, None, "수요일")
+    assert err is None and [s["taskId"] for s in picked] == [2], (picked, err)
+    # 안 돌고 있는 이름 → 멈추지 말고 알린다
+    picked, err = _pick_sessions(two, "없는거", None)
+    assert picked == [] and "돌고 있지 않아요" in err, err
+    # 하나만 돌면 지목 없이도 그것을 멈춘다 ('퇴근' 한 마디)
+    picked, err = _pick_sessions(two[:1], None, None)
+    assert err is None and len(picked) == 1
+    # 같은 이름이 두 워크에서 동시에 돌면 되묻는다
+    dup_run = [dict(two[1]), {**two[1], "taskId": 3, "workTitle": "목요일"}]
+    picked, err = _pick_sessions(dup_run, "오전", None)
+    assert picked == [] and "여럿이에요" in err, err
+    picked, err = _pick_sessions(dup_run, "오전", "목요일")
+    assert err is None and [s["taskId"] for s in picked] == [3], (picked, err)
+
+    # blaybus_stop 흐름을 가짜 서버로 통째로 확인한다.
+    # ⚠️ 실 계정으로 시험하면 4시간짜리 세션을 만들어야 하고, 블레이버스엔 삭제가
+    #    없어서 잔여물이 영구히 남는다. 그래서 _request만 갈아끼워 확인한다.
+    global _request
+
+    real_request, sent = _request, []
+
+    async def _fake(method, path, **kwargs):
+        body = kwargs.get("json")
+        sent.append((method, path, body))
+        if path == "/task-session/active":
+            # ⚠️ 두 개를 돌린다. 예전 셀프테스트는 하나만 써서 '하나만 끄랬는데 둘 다
+            #    꺼지는' 버그를 구조적으로 못 잡았다(2026-08-05 실사용자).
+            return httpx.Response(200, json={"data": {"list": [
+                {"taskId": 1, "taskTitle": "오전", "workTitle": "수요일", "elapsedSeconds": 18130},
+                {"taskId": 2, "taskTitle": "회의", "workTitle": "수요일", "elapsedSeconds": 60},
+            ]}})
+        if body is None:  # 확인 없는 stop → 서버가 분할을 요구한다
+            return _check(httpx.Response(400, json={
+                "message": "프로젝트의 태스크 최대 기록 시간(240분)을 초과합니다.",
+                "code": "STOP_SPLIT_REQUIRED",
+                "data": {"capMinutes": 240, "currentMinutes": 302, "parts": real_parts},
+            }))
+        return httpx.Response(200, json={"data": {}})
+
+    _request = _fake
+    try:
+        # ① 둘이 도는데 지목이 없으면 **아무것도 멈추지 않는다**
+        msg = asyncio.run(blaybus_stop.ainvoke({}))
+        assert "여럿이에요" in msg, msg
+        assert not [p for _, p, _ in sent if p.endswith("/stop")], "지목 없이 멈췄다"
+
+        # ② 이름을 주면 그것만 (여기선 4시간 초과라 확인부터 받는다)
+        sent.clear()
+        msg = asyncio.run(blaybus_stop.ainvoke({"task_title": "오전"}))
+        assert "나눠서 저장" in msg and "4시간 0분 + 1시간 2분" in msg, msg
+        # 쪼개진 뒤 이름을 흘리면 모델이 그 이름의 태스크를 찾아 시작하려 든다
+        assert "(1/2)" not in msg and "(2/2)" not in msg, msg
+        assert all(body is None for _, _, body in sent), "확인 전에 뭔가를 저장했다"
+        assert not any(p.endswith("/task/2/session/stop") for _, p, _ in sent), "'회의'를 건드렸다"
+
+        # ③ 확인받은 뒤 → 서버가 준 index를 그대로 되돌려준다. 지목한 것만.
+        sent.clear()
+        msg = asyncio.run(blaybus_stop.ainvoke({"task_title": "오전", "confirm_split": True}))
+        assert sent[-1] == ("POST", "/task/1/session/stop", {"selectedParts": [1, 2]}), sent[-1]
+        assert "나눠 저장" in msg, msg
+        assert not any(p.endswith("/task/2/session/stop") for _, p, _ in sent), "'회의'를 건드렸다"
+
+        # ④ "다 꺼줘" → 둘 다 멈춘다
+        sent.clear()
+        msg = asyncio.run(blaybus_stop.ainvoke({"all_running": True, "confirm_split": True}))
+        stopped_ids = {p for _, p, _ in sent if p.endswith("/stop")}
+        assert stopped_ids == {"/task/1/session/stop", "/task/2/session/stop"}, stopped_ids
+        assert "오전" in msg and "회의" in msg, msg
+    finally:
+        _request = real_request
 
     print("selftest OK")
 

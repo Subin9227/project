@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+import re
+
 import discord
 from discord import app_commands
 
@@ -148,6 +150,76 @@ class RegisterModal(discord.ui.Modal):
         await interaction.followup.send("\n".join(report), ephemeral=True)
 
 
+# 요일은 드롭다운으로만 받는다. 손으로 치게 하면 'wen'처럼 틀리는데,
+# _parse_weekly가 모르는 요일을 **조용히 월요일로** 떨어뜨려서 아무도 못 알아챈다
+# (2026-08-05: 수요일로 설정했다고 믿은 채 월요일 알림을 기다림).
+WEEKDAYS = [
+    app_commands.Choice(name="월요일", value="MON"),
+    app_commands.Choice(name="화요일", value="TUE"),
+    app_commands.Choice(name="수요일", value="WED"),
+    app_commands.Choice(name="목요일", value="THU"),
+    app_commands.Choice(name="금요일", value="FRI"),
+    app_commands.Choice(name="토요일", value="SAT"),
+    app_commands.Choice(name="일요일", value="SUN"),
+]
+
+# 24시간 HH:MM. 앞자리 0은 없어도 받고 저장할 때 채운다.
+_CLOCK = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+
+
+def parse_clock(value: str) -> str | None:
+    """'8:40' → '08:40'. 시각이 아니면 None.
+
+    ⚠️ 저장 전에 걸러야 한다. 예전엔 '8시40분'도 그대로 저장됐고, 한참 뒤
+       alarms._parse_time()이 ValueError로 터졌다. 넣은 사람은 성공한 줄 알고,
+       사고는 알림 루프에서 났다.
+    """
+    found = _CLOCK.match((value or "").strip())
+    return f"{int(found.group(1)):02d}:{found.group(2)}" if found else None
+
+
+def build_weekly(day: str | None, clock: str | None, current: str | None) -> str | None:
+    """(요일, 시각) 중 준 것만 바꿔 'WED 07:40' 꼴로. 둘 다 없으면 None(=안 바꿈).
+
+    저장 형식을 'MON 08:00'으로 유지하는 이유: alarms._parse_weekly가 그걸 읽는다.
+    """
+    if not day and not clock:
+        return None
+    parts = (current or "").split()
+    now_day = parts[0] if parts else "MON"
+    now_clock = parts[1] if len(parts) > 1 else "08:30"
+    return f"{day or now_day} {clock or now_clock}"
+
+
+# /setup의 target 인자를 해석할 낱말. 채널 ID를 외우고 있는 사람은 없다.
+_HERE = {"여기", "이채널", "here", "this"}
+_OFF = {"끄기", "꺼", "안받기", "없음", "off", "none"}
+
+
+def parse_alarm_target(
+    value: str | None, channel_id: int | str
+) -> tuple[str, str | None]:
+    """('keep'|'off'|'set', 설정할 값).
+
+    ⚠️ 값을 안 주면 **아무것도 안 바꾼다**('keep'). 예전엔 현재 채널로 조용히
+       채워서, 시간만 고치려고 /setup을 부른 사람의 채널이 전부 알림 대상이 됐다
+       (2026-08-04: 등록 6명에 알림 스케줄 4개). 같은 함수의 다른 칸들은
+       처음부터 '준 것만 갱신'이었는데 이 칸만 예외였다.
+    ⚠️ '끄기'는 받을 곳을 **지우지 않는다**('off'). 지웠더니 다시 켤 때 채널 ID를
+       또 찾아야 했고, 시간만 다시 넣은 사람은 알림이 안 와 영문을 몰랐다
+       (2026-08-05).
+    """
+    text = (value or "").strip()
+    if not text:  # 공백만 준 것도 '안 준 것'으로 본다
+        return "keep", None
+    low = text.lower()
+    if low in _OFF:
+        return "off", None
+    if low in _HERE:
+        return "set", str(channel_id)
+    return "set", text
+
+
 def _mask(value: str | None) -> str:
     """비밀은 앞 4자만 보여준다. 화면 공유·캡처로 새는 걸 막는다."""
     if not value:
@@ -176,19 +248,22 @@ def setup_commands(tree: app_commands.CommandTree) -> None:
     @tree.command(name="setup", description="알림 시각과 쓸 모델을 정해요")
     @app_commands.describe(
         model="쓸 모델 이름 (예: gpt-4o, claude-sonnet-4-5). 제공자는 /register에서 정해요",
-        target="알림 받을 곳의 ID (채널이든 나든). 비우면 이 채널",
+        target="알림 받을 곳: '여기'(이 채널) / '끄기' / 채널·사람 ID. 비우면 그대로 둬요",
         work_start="업무 시작 알림 시각 (예: 09:00)",
         work_end="업무 종료 알림 시각 (예: 18:00)",
-        weekly="주간 브리핑 (예: MON 08:00)",
+        weekday="주간 브리핑 요일 (목록에서 고르세요)",
+        weekly_time="주간 브리핑 시각 (예: 08:30)",
         mention="채널로 받을 때 멘션할 사람 ID. 비우면 나",
     )
+    @app_commands.choices(weekday=WEEKDAYS)
     async def setup(
         interaction: discord.Interaction,
         model: str | None = None,
         target: str | None = None,
         work_start: str | None = None,
         work_end: str | None = None,
-        weekly: str | None = None,
+        weekday: app_commands.Choice[str] | None = None,
+        weekly_time: str | None = None,
         mention: str | None = None,
     ):
         uid = str(interaction.user.id)
@@ -209,25 +284,57 @@ def setup_commands(tree: app_commands.CommandTree) -> None:
                 await interaction.followup.send(f"❌ {error}", ephemeral=True)
                 return
 
-        fields = {
-            "alarm_target": target or str(interaction.channel_id),
-            "alarm_mention": mention or uid,
-        }
+        fields: dict[str, str | None] = {}
+        action, new_target = parse_alarm_target(target, interaction.channel_id)
+        if action == "off":
+            # 받을 곳·멘션·시간은 그대로 두고 발송만 멈춘다. 다시 켤 때
+            # '/setup target:여기'만 치면 예전 설정이 그대로 살아난다.
+            fields["alarm_off"] = "1"
+        elif action == "set":
+            fields["alarm_target"] = new_target
+            fields["alarm_mention"] = mention or uid
+            fields["alarm_off"] = None  # 받을 곳을 정하면 자동으로 켜진다
+        elif mention:
+            fields["alarm_mention"] = mention.strip()
+
+        # 시각은 저장 전에 형식을 본다. 통과 못 하면 아무것도 저장하지 않는다 —
+        # 반만 저장되면 아가씨는 성공한 줄 알고 알림은 엉뚱하게 돈다.
+        clocks: dict[str, str] = {}
+        for label, key, raw in (
+            ("업무 시작", "work_start", work_start),
+            ("업무 종료", "work_end", work_end),
+            ("주간 브리핑", "weekly_time", weekly_time),
+        ):
+            if not raw:
+                continue
+            clock = parse_clock(raw)
+            if clock is None:
+                await interaction.followup.send(
+                    f"❌ {label} 시각 '{raw}'를 못 읽었어요. `08:40`처럼 넣어 주세요.",
+                    ephemeral=True,
+                )
+                return
+            clocks[key] = clock
+
+        weekly_at = build_weekly(
+            weekday.value if weekday else None, clocks.get("weekly_time"), me.weekly_at
+        )
         for key, value in (
-            ("llm_model", model),
-            ("work_start", work_start),
-            ("work_end", work_end),
-            ("weekly_at", weekly),
+            ("llm_model", model.strip() if model else None),
+            ("work_start", clocks.get("work_start")),
+            ("work_end", clocks.get("work_end")),
+            ("weekly_at", weekly_at),
         ):
             if value:
-                fields[key] = value.strip()
+                fields[key] = value
 
         users.save(uid, **fields)
         u = users.get(uid)
         await interaction.followup.send(
             "✅ 설정을 저장했어요.\n"
             f"  뇌: {u.llm_provider} / {u.llm_model or '(기본값)'}\n"
-            f"  받을 곳: {u.alarm_target}\n"
+            f"  알림 받을 곳: {u.alarm_target or '(아직 없음)'}"
+            f"{' — 지금은 꺼둠' if u.alarm_off else ''}\n"
             f"  업무: {u.work_start or '(안 함)'} ~ {u.work_end or '(안 함)'}\n"
             f"  주간: {u.weekly_at or '(안 함)'}",
             ephemeral=True,
@@ -250,8 +357,17 @@ def setup_commands(tree: app_commands.CommandTree) -> None:
                     f"  과제 DB: {u.homework_ds_id or '없음'}",
                     f"블레이버스: {u.blaybus_id or '없음'}"
                     f" / 비번 {_mask(u.blaybus_pw)} / 프로젝트 {u.blaybus_pid or '-'}",
-                    f"알림: {u.alarm_target or '없음'}"
-                    f" ({u.work_start or '-'}~{u.work_end or '-'}, 주간 {u.weekly_at or '-'})",
+                    f"알림: {u.alarm_target or '아직 없음'}"
+                    f"{' (꺼둠)' if u.alarm_off else ''}"
+                    f" ({u.work_start or '-'}~{u.work_end or '-'}, 주간 {u.weekly_at or '-'})"
+                    # 예전 /setup이 채널을 조용히 등록해서, 받는 줄 모르는 사람이 있다
+                    + (
+                        " — 켜려면 `/setup target:여기`"
+                        if u.alarm_off
+                        else " — 끄려면 `/setup target:끄기`"
+                        if u.alarm_target
+                        else ""
+                    ),
                     f"오늘 쓴 메시지: {u.daily_count if u.count_date else 0}",
                 ]
             ),
@@ -323,6 +439,41 @@ def _selftest() -> None:
     assert len(PROVIDERS) == 3
     # 고지 문장이 비어 있으면 안 된다 — 이게 이 단계의 산출물이다
     assert "비밀번호" in WARNING and "/forget" in WARNING
+
+    # /setup의 target 해석. 여기가 알림 대상이 멋대로 늘어나던 자리다.
+    # 값을 안 주면 건드리지 않는다 (예전엔 현재 채널로 조용히 채웠다)
+    assert parse_alarm_target(None, 111) == ("keep", None)
+    assert parse_alarm_target("", 111) == ("keep", None)
+    assert parse_alarm_target("   ", 111) == ("keep", None)  # 공백만도 '안 준 것'
+    # 끄기 — 받을 곳을 지우는 게 아니라 '멈춤'이다 (지우면 다시 켤 때 ID를 또 찾아야 한다)
+    for word in ("끄기", "off", "OFF", "없음", " 안받기 "):
+        assert parse_alarm_target(word, 111) == ("off", None), word
+    # 이 채널
+    for word in ("여기", "here", "HERE", " 이채널 "):
+        assert parse_alarm_target(word, 111) == ("set", "111"), word
+    # 그 밖엔 준 값 그대로 (채널이든 사람이든 ID)
+    assert parse_alarm_target(" 1533725805023203369 ", 111) == ("set", "1533725805023203369")
+    assert isinstance(parse_alarm_target("여기", 111), tuple)
+
+    # 시각은 저장 전에 걸러야 한다 — 예전엔 '8시40분'이 저장되고 알림 루프에서 터졌다
+    assert parse_clock("08:40") == "08:40"
+    assert parse_clock("8:40") == "08:40"  # 앞자리 0은 채워준다
+    assert parse_clock(" 23:59 ") == "23:59"
+    assert parse_clock("00:00") == "00:00"
+    for bad in ("8시40분", "8-40", "24:00", "12:60", "0840", "", None, "WED"):
+        assert parse_clock(bad) is None, bad
+
+    # 요일·시각 중 준 것만 바꾼다. 저장 형식은 'WED 07:40' (alarms._parse_weekly가 읽는다)
+    assert build_weekly("WED", "07:40", None) == "WED 07:40"
+    assert build_weekly("WED", None, "MON 08:30") == "WED 08:30"  # 시각 유지
+    assert build_weekly(None, "07:40", "MON 08:30") == "MON 07:40"  # 요일 유지
+    assert build_weekly(None, None, "MON 08:30") is None  # 둘 다 없으면 안 바꾼다
+    assert build_weekly("WED", None, None) == "WED 08:30"  # 기존이 없으면 기본 시각
+    assert isinstance(build_weekly("WED", "07:40", None), str)
+
+    # 요일은 드롭다운으로만 받는다 (손으로 치면 'wen'이 된다)
+    assert [c.value for c in WEEKDAYS] == ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+    assert [c.name for c in WEEKDAYS][2] == "수요일"
     print("selftest OK")
 
 

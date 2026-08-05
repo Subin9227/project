@@ -155,7 +155,8 @@ def show_one(db: sqlite3.Connection, needle: str, full: bool) -> None:
     cp = SERDE.loads_typed((type_, cp_blob))
     md = _load_metadata(type_, md_blob)
 
-    print(f"thread_id : {thread_id}   (디스코드 채널 ID)")
+    # ⚠️ 채널 ID가 아니라 '사용자ID:KST날짜'다 (#9 Phase 0에서 바뀌었다).
+    print(f"thread_id : {thread_id}   (디스코드 사용자 ID : KST 날짜)")
     print(f"id        : {cid}")
     print(f"parent    : {pid or '(없음 — 이 스레드의 첫 스냅샷)'}")
     print(f"저장시각  : {cp['ts']}  (UTC)")

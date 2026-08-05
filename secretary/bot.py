@@ -27,13 +27,20 @@ from langgraph.errors import GraphRecursionError
 from secretary import context, users
 from secretary.agent import build_agent, build_tools
 from secretary.alarms import (
-    _WEEKDAY_KR,
+    audit_users,
     build_alarm_loop,
+    format_audit,
     load_schedules,
     resolve_target,
 )
 from secretary.commands import setup_commands
-from secretary.config import DISCORD_BOT_TOKEN, KST, MEMORY_DB_PATH, OWNER_ID
+from secretary.config import (
+    DISCORD_BOT_TOKEN,
+    KST,
+    MEMORY_DB_PATH,
+    MEMORY_KEEP_DAYS,
+    OWNER_ID,
+)
 from secretary.webserver import attach_client, build_health_server
 
 # 디스코드 한 메시지의 최대 길이. 초과분은 잘라서 보낸다.
@@ -46,8 +53,14 @@ RECURSION_LIMIT = 12
 # 겹2: 한 메시지 처리의 벽시계 상한(초). 넘으면 중단하고 사과 답장.
 AGENT_TIMEOUT_SEC = 90
 
-# 대화기억을 며칠치 남길지. 오늘 포함이므로 7 = 오늘~6일 전.
-KEEP_DAYS = 7
+# LangGraph가 스텝 부족일 때 답변 자리에 끼워 넣는 문장. 예외가 아니라 평범한
+# AIMessage로 오기 때문에, 문자열로 알아보는 수밖에 없다.
+# ⚠️ 라이브러리가 문구를 바꾸면 조용히 안 걸린다 → 셀프테스트가 실제 소스를 확인한다.
+LANGGRAPH_OUT_OF_STEPS = "Sorry, need more steps to process this request."
+
+# 대화기억을 며칠치 남길지. 오늘 포함이므로 7 = 오늘~6일 전. 0이면 안 지운다.
+# 값은 .env의 MEMORY_KEEP_DAYS로 바꾼다 (config.py 참고).
+KEEP_DAYS = MEMORY_KEEP_DAYS
 
 
 def _today_kst() -> str:
@@ -69,7 +82,13 @@ async def _prune_old_threads(checkpointer: AsyncSqliteSaver) -> int:
 
     ponytail: 시작할 때 1회. 프로세스가 몇 달씩 안 죽으면 그때 main()의
     asyncio.gather에 하루 한 번 도는 태스크로 올린다.
+
+    KEEP_DAYS가 0이면 한 건도 안 지운다(테스트 기간용). 지워버리면 사용자들이
+    무슨 말을 했고 봇이 어떻게 답했는지 되짚을 방법이 사라진다.
     """
+    if KEEP_DAYS <= 0:
+        return 0
+
     today = datetime.now(KST).date()
     keep = {(today - timedelta(days=d)).isoformat() for d in range(KEEP_DAYS)}
 
@@ -107,7 +126,16 @@ def _extract_text(message) -> str:
             if isinstance(block, dict) and block.get("type") == "text"
         ]
         text = "".join(parts)
-    text = text.strip() or "야레야레... 아가씨, 지금은 드릴 말씀이 마땅치 않네요."
+    text = text.strip()
+    # ⚠️ create_react_agent는 스텝이 모자라면 **예외를 던지지 않고** 이 영어 문장을
+    #    보통 답변처럼 돌려준다(langgraph/prebuilt/chat_agent_executor.py).
+    #    그래서 아래 GraphRecursionError 핸들러가 안 걸리고 아가씨가 영어를 본다.
+    if text == LANGGRAPH_OUT_OF_STEPS:
+        text = (
+            "야레야레 아가씨, 이것저것 찾아보다 제 걸음 수를 다 썼어요. "
+            "한 번에 하나씩, 조금만 더 구체적으로 말씀해 주시겠어요?"
+        )
+    text = text or "야레야레... 아가씨, 지금은 드릴 말씀이 마땅치 않네요."
     return text[:DISCORD_MAX_LEN]
 
 
@@ -126,28 +154,67 @@ def _allowed(discord_id: str) -> bool:
     return bool(user and user.registered)
 
 
-async def _describe_target(client: discord.Client, schedule) -> str:
-    """알림이 실제로 어디로 갈지 사람이 읽을 수 있게.
+async def _describe_target(client: discord.Client, target: str) -> tuple[str, bool]:
+    """알림이 실제로 어디로 갈지 (사람이 읽을 이름, 닿는가).
 
     기동할 때 확인시켜 주는 게 핵심이다: 채널 ID를 잘못 넣으면 알림 시각이
     되어서야 실패를 알게 되는데, 그땐 이미 한 번 놓친 뒤다.
+    ⚠️ '닿는가'는 채널이 살아있고 봇이 볼 수 있다는 뜻일 뿐이다. 사람이 다른
+       채널로 옮겨간 경우는 여기서 못 잡는다 — 옛 채널로 잘 배달된다.
     """
     try:
-        dest, kind = await resolve_target(client, schedule.target)
+        dest, kind = await resolve_target(client, target)
     except Exception as e:  # noqa: BLE001
-        return (
-            f"⚠️ {schedule.target}를 채널로도 사람으로도 못 찾았어요 "
-            f"({type(e).__name__}) — 이대로면 알림이 안 갑니다"
-        )
+        return f"⚠️ {target} ({type(e).__name__})", False
 
     if kind == "user":
-        return f"DM → {dest}"
+        return f"DM → {dest}", True
 
     name = getattr(dest, "name", None) or str(dest)
     guild = getattr(dest, "guild", None)
-    where = f"{guild.name} / #{name}" if guild else f"#{name}"
-    mention = " (멘션 켬)" if schedule.mention_id else " (멘션 없음)"
-    return f"{where}{mention}"
+    return (f"{guild.name} / #{name}" if guild else f"#{name}"), True
+
+
+async def _display_name(client: discord.Client, uid: str) -> str:
+    """디스코드에서 보이는 이름. 서버 별명이 있으면 그게 우선.
+
+    fetch_user는 계정 아이디(hwamgai)만 준다. 사람들이 서로를 알아보는 건
+    서버 별명('linda.hwang(황수빈)/인공지능')이라, 서버 쪽을 먼저 뒤진다.
+    ⚠️ members 인텐트가 없어 캐시가 비어 있으므로 fetch_member로 물어본다.
+       서버 수만큼 호출될 수 있지만 기동할 때 한 번뿐이다.
+    """
+    for guild in client.guilds:
+        member = guild.get_member(int(uid))  # 캐시에 있으면 공짜
+        if member is not None:
+            return member.display_name
+    for guild in client.guilds:
+        try:
+            return (await guild.fetch_member(int(uid))).display_name
+        except Exception:  # noqa: BLE001 - 그 서버에 없는 사람
+            continue
+    try:  # 어느 서버에서도 못 찾으면 계정 이름이라도
+        user = await client.fetch_user(int(uid))
+        return user.display_name
+    except Exception:  # noqa: BLE001 - 탈퇴 등
+        return "(이름 못 찾음)"
+
+
+async def _alarm_table(client: discord.Client) -> str:
+    """기동 로그에 찍을 알림 표. ID를 사람 이름·채널 이름으로 바꿔 넣는다.
+
+    이름 조회는 등록자 수만큼 API를 부르므로 기동이 조금 느려진다. 봇은 자주 켜지
+    않고, 이 표를 보는 목적이 '누가 언제 받나'라서 ID만으로는 쓸모가 없다.
+    """
+    rows = audit_users()
+    names: dict[str, str] = {}
+    for row in rows:
+        uid = row["discord_id"]
+        if uid and uid not in names:
+            names[uid] = await _display_name(client, uid)
+        # 받을 곳이 없는 사람은 물어볼 것도 없다 ('연결' 칸은 '—'로 남는다)
+        if row["target"]:
+            row["place"], row["reach"] = await _describe_target(client, row["target"])
+    return format_audit(rows, names, OWNER_ID)
 
 
 async def main() -> None:
@@ -164,7 +231,11 @@ async def main() -> None:
     # (async with 블록이 유지되는 동안 SQLite 연결이 살아있다.)
     async with AsyncSqliteSaver.from_conn_string(str(MEMORY_DB_PATH)) as checkpointer:
         pruned = await _prune_old_threads(checkpointer)
-        if pruned:
+        if KEEP_DAYS <= 0:
+            # 꺼져 있다고 말해주지 않으면 '조용한 것'과 '지울 게 없는 것'을 구분할 수 없다
+            size_mb = MEMORY_DB_PATH.stat().st_size / 1024 / 1024
+            print(f"대화기억 정리: 꺼짐 (MEMORY_KEEP_DAYS=0, 현재 {size_mb:.1f}MB)")
+        elif pruned:
             size_mb = MEMORY_DB_PATH.stat().st_size / 1024 / 1024
             print(f"낡은 대화기억 {pruned}개 정리 완료 (현재 {size_mb:.1f}MB)")
 
@@ -205,19 +276,16 @@ async def main() -> None:
             count = len(users.all_users()) if users.enabled() else 0
             print(f"   등록된 사용자: {count}명  (자세히는 /users)")
 
+            # 등록자 전원을 표로. 알림이 안 가는 사람도 '왜 안 가는지'까지 보여준다 —
+            # 예전엔 가는 것만 찍어서, 등록만 하고 /setup을 안 한 사람이 안 보였다.
+            print(await _alarm_table(client))
+
             # 알림은 로그인 뒤에 켠다 (DM을 보내려면 게이트웨이가 붙어 있어야 한다).
             # on_ready는 재접속 때도 불리므로 이미 돌고 있으면 다시 켜지 않는다.
-            schedules = load_schedules()
-            if not schedules:
+            if not load_schedules():
                 print("   알림: 꺼짐 (ALARM_TARGET도 /setup도 없음)")
             elif not alarm_loop.is_running():
                 alarm_loop.start()
-                for s in schedules:
-                    print(f"   알림 → {await _describe_target(client, s)}")
-                    print(
-                        f"        업무 {s.work_start:%H:%M}~{s.work_end:%H:%M}, "
-                        f"주간 {_WEEKDAY_KR[s.weekly_day]} {s.weekly_at:%H:%M}"
-                    )
 
         @client.event
         async def on_message(message: discord.Message):
@@ -346,3 +414,33 @@ async def main() -> None:
             client.start(DISCORD_BOT_TOKEN),
             health_server.serve(),
         )
+
+
+def _selftest() -> None:
+    """디스코드 없이 확인할 수 있는 것만. 나머지는 실제 기동으로 본다."""
+    import inspect
+
+    from langchain_core.messages import AIMessage
+    from langgraph.prebuilt import chat_agent_executor
+
+    # ⚠️ 이 문장이 라이브러리와 어긋나면 영어가 그대로 아가씨께 나간다.
+    #    langgraph를 올릴 때 여기서 걸리라고 실제 소스를 확인한다.
+    assert LANGGRAPH_OUT_OF_STEPS in inspect.getsource(chat_agent_executor), (
+        "langgraph의 스텝 부족 문구가 바뀌었다 — LANGGRAPH_OUT_OF_STEPS를 맞출 것"
+    )
+    got = _extract_text(AIMessage(content=LANGGRAPH_OUT_OF_STEPS))
+    assert "야레야레" in got and "Sorry" not in got, got
+
+    # 평범한 답변은 그대로, 빈 답변은 페르소나 문구로
+    assert _extract_text(AIMessage(content="네, 아가씨!")) == "네, 아가씨!"
+    assert "드릴 말씀이" in _extract_text(AIMessage(content="  "))
+    # 블록 리스트에서 text만 뽑는다 (tool_use 블록은 버린다)
+    blocks = [{"type": "text", "text": "가"}, {"type": "tool_use", "name": "x"}]
+    assert _extract_text(AIMessage(content=blocks)) == "가"
+    # 2000자 상한
+    assert len(_extract_text(AIMessage(content="가" * 3000))) == DISCORD_MAX_LEN
+    print("selftest OK")
+
+
+if __name__ == "__main__":
+    _selftest()

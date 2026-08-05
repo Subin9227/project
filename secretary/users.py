@@ -43,6 +43,9 @@ _COLUMNS = (
     # 알림 (Phase 2의 .env 설정이 여기로 옮겨온다)
     "alarm_target",
     "alarm_mention",
+    # 알림을 잠시 멈춤('1'). 받을 곳은 그대로 두고 발송만 막는다 —
+    # 끌 때 alarm_target을 지우면 다시 켤 때 채널 ID를 또 찾아야 한다.
+    "alarm_off",
     "work_start",
     "work_end",
     "weekly_at",
@@ -106,6 +109,7 @@ class User:
     blaybus_pid: str | None = None
     alarm_target: str | None = None
     alarm_mention: str | None = None
+    alarm_off: str | None = None
     work_start: str | None = None
     work_end: str | None = None
     weekly_at: str | None = None
@@ -122,6 +126,13 @@ def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(USERS_DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.executescript(_SCHEMA)
+    # ⚠️ CREATE TABLE IF NOT EXISTS는 이미 있는 표에 칸을 **안 늘린다.** 칸을 더하면
+    #    기존 사용자들의 행은 그 칸 없이 남아 SELECT * 결과가 User(**data)에서 터진다.
+    #    그래서 열 때마다 빠진 칸을 채운다 (있으면 아무 일도 안 한다).
+    have = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+    for col in _COLUMNS:
+        if col not in have:
+            conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
     return conn
 
 
@@ -257,6 +268,19 @@ def _selftest() -> None:
 
     assert len(all_users()) == 2
     assert isinstance(all_users()[0], User)
+
+    # 알림 끄기는 받을 곳을 지우지 않는다 — 지우면 다시 켤 때 채널 ID를 또 찾아야 한다
+    save("1", alarm_target="ch1", alarm_mention="me", work_start="08:40")
+    save("1", alarm_off="1")
+    u = get("1")
+    assert u.alarm_off == "1" and u.alarm_target == "ch1" and u.work_start == "08:40"
+    save("1", alarm_off=None)
+    assert get("1").alarm_off is None and get("1").alarm_target == "ch1"
+
+    # 칸을 나중에 더해도 옛 DB가 열려야 한다 (CREATE TABLE IF NOT EXISTS는 안 늘린다)
+    with _connect() as conn:
+        conn.execute("ALTER TABLE users DROP COLUMN alarm_off")
+    assert get("1").alarm_off is None, "빠진 칸을 다시 채우지 못했다"
 
     # 하루 한도
     assert bump_daily("1", 2) and bump_daily("1", 2)

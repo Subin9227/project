@@ -53,17 +53,29 @@ ITEMS: dict[str, str] = {
     "회고": "회고",
 }
 
-# 사용자가 다르게 말할 수 있는 표현 → 표준 키
+# 사용자가 다르게 말할 수 있는 표현 → 표준 키.
+# ⚠️ 키는 **공백 없이** 적는다. _resolve_item이 _norm()으로 공백을 지운 뒤 찾기 때문에,
+#    "미라클 모닝"이라 적어두면 영영 안 걸린다.
+# 항목의 실제 뜻: 도착 8시=8시 전 출근(미라클 모닝) / 어드민나잇=야간자습 /
+#                 영어 스피킹=회화 공부
 ALIASES: dict[str, str] = {
     "코딩테스트": "코테",
     "코딩": "코테",
     "도착": "도착8시",
     "8시": "도착8시",
     "출근": "도착8시",
+    "미라클모닝": "도착8시",
+    "미라클": "도착8시",
+    "헬스": "운동",
+    "운동하기": "운동",
     "영어": "영어스피킹",
     "스피킹": "영어스피킹",
+    "회화": "영어스피킹",
+    "회화공부": "영어스피킹",
     "어드민": "어드민나잇",
     "어드민나이트": "어드민나잇",
+    "야간자습": "어드민나잇",
+    "야자": "어드민나잇",
 }
 
 
@@ -91,6 +103,23 @@ def _resolve_item(item: str) -> str | None:
     if key in ALIASES:
         return ITEMS[ALIASES[key]]
     return None
+
+
+def item_guide() -> str:
+    """모델에게 줄 '항목과 그 별칭' 한 줄. agent.py가 시스템 메시지에 싣는다.
+
+    ⚠️ 별칭은 _resolve_item() 안에서만 도는데, 그건 **도구가 실행된 뒤**의 코드다.
+       모델은 그 앞에서 판단하므로, 알려주지 않으면 '미라클모닝'을 없는 항목으로 보고
+       도구를 아예 안 부른다(2026-08-05 실제 발생). ITEMS·ALIASES가 유일한 출처라,
+       별칭을 늘리면 프롬프트가 저절로 따라온다.
+    """
+    said_as: dict[str, list[str]] = {key: [] for key in ITEMS}
+    for said, key in ALIASES.items():
+        said_as[key].append(said)
+    return " / ".join(
+        f"{prop}({'·'.join(said_as[key])})" if said_as[key] else prop
+        for key, prop in ITEMS.items()
+    )
 
 
 # --- 노션 REST 헬퍼 -------------------------------------------------------
@@ -225,6 +254,45 @@ async def _query_rows(client: httpx.AsyncClient, ds_id: str, filter_: dict) -> l
     return resp.json().get("results", [])
 
 
+class ItemMissing(context.UserFacing):
+    """노션 DB에 그 이름의 체크박스가 없다. 메시지는 그대로 아가씨께 나간다."""
+
+
+async def _set_checkbox(
+    client: httpx.AsyncClient, row_id: str, prop: str, checked: bool = True
+) -> None:
+    """행의 체크박스 하나를 켜거나 끈다. 없는 속성이면 ItemMissing.
+
+    ⚠️ ITEMS는 아가씨 노션의 속성 이름을 **코드가 베껴 들고 있는 것**이다. 노션에서
+       '운동'을 '헬스'로 바꾸면 여기서 400이 나는데, 그대로 흘리면
+       "노션 처리 중 오류 (400): {...}" 라는 알아볼 수 없는 답이 나간다.
+       실제로 있는 이름을 보여주는 편이 낫다.
+       ⏭️ 근본 해결은 ITEMS를 버리고 DB 스키마에서 읽어오는 것 (CLAUDE.md 참고).
+    """
+    resp = await client.patch(
+        f"{NOTION_API_BASE}/pages/{row_id}",
+        headers=_headers(),
+        json={"properties": {prop: {"checkbox": checked}}},
+    )
+    if resp.status_code != 400:
+        resp.raise_for_status()
+        return
+
+    page = await client.get(f"{NOTION_API_BASE}/pages/{row_id}", headers=_headers(json=False))
+    page.raise_for_status()
+    boxes = [
+        name
+        for name, val in page.json().get("properties", {}).items()
+        if isinstance(val, dict) and val.get("type") == "checkbox"
+    ]
+    if prop in boxes:  # 400의 원인이 이름이 아니면 원래대로 터뜨린다
+        resp.raise_for_status()
+    raise ItemMissing(
+        f"노션에 '{prop}' 체크박스가 없어요. 지금 있는 항목: {' / '.join(boxes) or '(하나도 없어요)'}. "
+        "노션에서 이름을 바꾸셨다면 원래대로 되돌리거나 그 이름으로 말씀해 주세요."
+    )
+
+
 async def _find_row(client: httpx.AsyncClient, day: str) -> dict | None:
     """대상 날짜의 데일리루틴 행. 없으면 None (만들지 않는다)."""
     rows = await _query_rows(
@@ -314,6 +382,46 @@ async def _locate_section(
     return None, None
 
 
+async def _section_blocks(
+    client: httpx.AsyncClient, page_id: str, heading_id: str
+) -> list[dict]:
+    """그 칸(헤딩) 아래에 실제로 붙어 있는 블록들. 다음 헤딩을 만나면 멈춘다.
+
+    노션은 헤딩 아래 내용을 '자식'으로 담지 않는다 — 전부 페이지의 형제 블록이고,
+    다음 헤딩이 나올 때까지가 그 칸의 몫이다. 그래서 순서대로 훑어야 한다.
+    """
+    out: list[dict] = []
+    collecting = False
+    for block in await _blocks_of(client, page_id):
+        if block["id"] == heading_id:
+            collecting = True
+            continue
+        if not collecting:
+            continue
+        if block.get("type") in _HEADINGS:
+            break
+        out.append(block)
+    return out
+
+
+def _append_anchor(section: list[dict], heading_id: str) -> str:
+    """덧붙일 때 어느 블록 뒤에 넣을지. 칸의 마지막 블록, 비었으면 헤딩.
+
+    ⚠️ 항상 헤딩 뒤에 넣으면 새 글이 매번 맨 위에 꽂혀서, 회고를 위에서 아래로
+       읽을 때 시간이 거꾸로 흐른다 (2026-08-04 실사용자 화면에서 확인).
+    """
+    return section[-1]["id"] if section else heading_id
+
+
+def _paragraph_text(block: dict) -> str | None:
+    """문단 블록이면 그 글자를, 아니면 None (사진·구분선 등)."""
+    if block.get("type") != "paragraph":
+        return None
+    return "".join(
+        rt.get("plain_text", "") for rt in block["paragraph"].get("rich_text", [])
+    )
+
+
 def _compress_image(data: bytes) -> tuple[bytes, str, str]:
     """5MB 초과 이미지를 JPEG로 압축/축소한다. (bytes, filename, content_type) 반환."""
     img = Image.open(io.BytesIO(data))
@@ -387,7 +495,7 @@ async def attach_routine_photo(
     check: bool = True,
     note: str = "",
 ) -> str:
-    """데일리루틴 항목에 인증 사진(+선택 메모)을 넣고, 필요하면 체크박스를 켠다.
+    """**노션** 데일리루틴 항목에 인증 사진(+선택 메모)을 넣고, 필요하면 체크박스를 켠다.
 
     '사진 = 증거'와 '체크박스 = 달성'은 별개다. 항목을 실제로 달성했으면 체크박스를
     켜고(check=True), 증거만 남기고 달성은 아닐 때는 사진만 넣는다(check=False).
@@ -457,12 +565,7 @@ async def attach_routine_photo(
 
             # 체크박스: check=True일 때만 켠다. False면 건드리지 않는다(미달성·증거만).
             if check:
-                chk = await client.patch(
-                    f"{NOTION_API_BASE}/pages/{row_id}",
-                    headers=_headers(),
-                    json={"properties": {resolved: {"checkbox": True}}},
-                )
-                chk.raise_for_status()
+                await _set_checkbox(client, row_id, resolved)
 
         # 결과 문구를 실제 수행한 내용에 맞춰 조립
         did = f"메모('{note_text}')와 사진을" if note_text else "사진을"
@@ -482,7 +585,7 @@ async def attach_routine_photo(
 
 @tool
 async def routine_today(date: str = "today") -> str:
-    """데일리루틴에서 그날 뭘 했고 뭐가 남았는지 확인한다.
+    """**노션** 데일리루틴에서 그날 뭘 했고 뭐가 남았는지 확인한다.
 
     "오늘 뭐 했지?", "오늘 루틴 어때?", "뭐 남았어?" 같은 물음에 이걸 쓴다.
 
@@ -520,7 +623,7 @@ async def routine_today(date: str = "today") -> str:
 
 @tool
 async def routine_check(item: str, checked: bool = True, date: str = "today") -> str:
-    """데일리루틴 항목의 체크박스만 켜거나 끈다 (사진 없이).
+    """**노션** 데일리루틴 항목의 체크박스만 켜거나 끈다 (사진 없이).
 
     "운동 다녀왔어", "코테 했어" 처럼 사진 없이 달성만 알릴 때 쓴다.
     사진도 같이 넣어야 하면 attach_routine_photo를 쓴다.
@@ -541,12 +644,7 @@ async def routine_check(item: str, checked: bool = True, date: str = "today") ->
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             row_id = await _find_or_create_row(client, day)
-            resp = await client.patch(
-                f"{NOTION_API_BASE}/pages/{row_id}",
-                headers=_headers(),
-                json={"properties": {resolved: {"checkbox": checked}}},
-            )
-            resp.raise_for_status()
+            await _set_checkbox(client, row_id, resolved, checked)
         state = "켰어요" if checked else "껐어요"
         return f"{day} 데일리루틴 '{resolved}' 체크박스를 {state}."
     except httpx.HTTPStatusError as e:
@@ -557,29 +655,51 @@ async def routine_check(item: str, checked: bool = True, date: str = "today") ->
 
 @tool
 async def routine_write(
-    section: str, text: str, date: str = "today", check: bool = True
+    section: str,
+    text: str,
+    date: str = "today",
+    check: bool = True,
+    mode: str = "append",
 ) -> str:
-    """데일리루틴 행의 특정 칸(헤딩) 아래에 글을 적고, 그 항목 체크박스를 켠다.
+    """**노션** 데일리루틴 행의 특정 칸(헤딩) 아래에 글을 적고, 그 항목 체크박스를 켠다.
 
-    회고를 받아적을 때 쓴다. 칸 이름은 노션 템플릿에 있는 그대로 넘긴다 —
-    예: '오늘 한 일', '오늘의 특별한 점', '셀프 회고: 칭찬', '셀프 회고: 반성'.
-    어떤 칸이 있는지 모르면 틀린 이름으로 한 번 불러라. 있는 칸 목록을 알려준다.
+    칸은 두 종류다. **항목마다 자기 칸이 있다** — '영어 스피킹 30분 했다'처럼 그 항목에
+    딸린 이야기는 회고가 아니라 **그 항목 칸**('영어 스피킹')에 적는다. 회고 아래에는
+    세부 칸이 따로 있다('오늘 한 일', '오늘의 특별한 점', '셀프 회고: 칭찬' 등).
+
+    ⚠️ 여기 적힌 이름이 전부가 아니다. 칸은 노션 템플릿이 정하므로, 확실하지 않으면
+    **원하는 이름으로 그냥 한 번 불러라** — 없으면 있는 칸 목록을 그대로 알려준다.
+    "적을 칸이 없다"고 아가씨께 말하기 전에 반드시 이 방법으로 확인해라.
 
     회고 아래 어느 칸을 채우든 '회고' 체크박스가 켜진다 (한 칸만 채워도 켜진다).
+    항목 칸에 적으면 그 항목 체크박스가 켜진다.
+
+    ⚠️ **이미 적혀 있던 내용을 결과로 함께 알려준다.** 아가씨께 답할 때 그걸 보고
+    "이미 이렇게 적혀 있는데 더할까요, 갈아 끼울까요?"처럼 안내해라.
+    같은 내용을 이미 적었는지 지레짐작하지 말 것 — 이 도구가 알려준다.
 
     Args:
-        section: 글을 넣을 칸(헤딩) 이름.
+        section: 글을 넣을 칸(헤딩) 이름. 항목 이름을 그대로 넣어도 된다.
         text: 넣을 내용. 줄바꿈이 있으면 문단이 나뉜다.
         date: 대상 날짜 YYYY-MM-DD. 기본 'today' = 오늘.
         check: True면 그 칸이 속한 항목 체크박스를 켠다. 아가씨가 "체크는 하지 마"
             라고 할 때만 False.
+        mode: 'append'(기본)는 뒤에 덧붙이되 **이미 똑같이 적힌 줄은 건너뛴다**.
+            'replace'는 그 칸의 기존 문단을 지우고 새로 쓴다 — 블레이버스 시간처럼
+            **값이 갱신되는 내용을 다시 적을 때** 쓴다(덧붙이면 옛 숫자가 같이 남는다).
+            ⚠️ replace는 아가씨가 노션에서 손으로 쓰신 글도 지운다. 갱신이 확실할
+            때만 쓰고, 애매하면 append로 두고 여쭤라. (사진은 지우지 않는다)
 
     Returns:
-        처리 결과 문자열.
+        처리 결과 문자열. 원래 적혀 있던 내용이 있으면 함께 돌려준다.
     """
     body = text.strip()
     if not body:
         return "적을 내용이 비어 있어요, 아가씨."
+
+    mode = (mode or "append").strip().lower()
+    if mode not in ("append", "replace"):
+        return f"mode는 'append'나 'replace'여야 해요 (받은 값: '{mode}')."
 
     day = _day_or_today(date)
     try:
@@ -590,17 +710,52 @@ async def routine_write(
                 found = ", ".join(await _list_headings(client, row_id)) or "(하나도 없어요)"
                 return f"'{section}' 칸을 못 찾았어요. 있는 칸: {found}"
 
-            paragraphs = [
-                {"type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": ln}}]}}
-                for ln in body.splitlines()
-                if ln.strip()
-            ]
-            resp = await client.patch(
-                f"{NOTION_API_BASE}/blocks/{row_id}/children",
-                headers=_headers(),
-                json={"after": heading_id, "children": paragraphs},
-            )
-            resp.raise_for_status()
+            # ⚠️ 예전엔 기존 내용을 보지도 않고 헤딩 뒤에 무조건 끼워 넣었다. 그래서
+            #    블레이버스 시간을 두 번 적으면 옛 숫자와 새 숫자가 나란히 쌓였다.
+            #    (2026-08-04 실사용자 제보: "노션 수정할때 자꾸 추가만 해줘요")
+            before = await _section_blocks(client, row_id, heading_id)
+            existing = [t for t in map(_paragraph_text, before) if t and t.strip()]
+
+            lines = [ln for ln in body.splitlines() if ln.strip()]
+            removed = skipped = 0
+            # 새 글을 어느 블록 뒤에 끼울지. 헤딩 뒤에 넣으면 항상 맨 위에 꽂혀서
+            # 덧붙일수록 시간이 거꾸로 흐른다(2026-08-04 실사용자 화면에서 확인).
+            # 덧붙이기는 칸의 끝에, 갈아치우기는 칸의 앞에(템플릿의 '글 다음 사진' 순서 유지).
+            anchor = heading_id
+            if mode == "append":
+                anchor = _append_anchor(before, heading_id)
+                have = {_norm(t) for t in existing}
+                kept = [ln for ln in lines if _norm(ln) not in have]
+                skipped = len(lines) - len(kept)
+                lines = kept
+            else:  # replace — 글이 든 문단만 지운다.
+                # ⚠️ 사진(attach_routine_photo가 넣은 image)과 템플릿이 칸 끝에 두는
+                #    빈 문단은 건드리지 않는다. 지우면 인증 사진이 날아가고 칸 모양이
+                #    무너지는데, 둘 다 아가씨가 손으로 되돌려야 하는 종류다.
+                for block in before:
+                    if not (_paragraph_text(block) or "").strip():
+                        continue
+                    gone = await client.delete(
+                        f"{NOTION_API_BASE}/blocks/{block['id']}",
+                        headers=_headers(json=False),
+                    )
+                    gone.raise_for_status()
+                    removed += 1
+
+            if lines:
+                paragraphs = [
+                    {
+                        "type": "paragraph",
+                        "paragraph": {"rich_text": [{"text": {"content": ln}}]},
+                    }
+                    for ln in lines
+                ]
+                resp = await client.patch(
+                    f"{NOTION_API_BASE}/blocks/{row_id}/children",
+                    headers=_headers(),
+                    json={"after": anchor, "children": paragraphs},
+                )
+                resp.raise_for_status()
 
             # 글을 쓴 칸이 속한 항목의 체크박스를 켠다.
             # ('셀프 회고: 칭찬'에 쓰면 '회고'가 켜진다 — 소속은 _locate_section이 찾는다)
@@ -608,17 +763,29 @@ async def routine_write(
             if check and owner:
                 prop = _resolve_item(owner)
                 if prop:
-                    chk = await client.patch(
-                        f"{NOTION_API_BASE}/pages/{row_id}",
-                        headers=_headers(),
-                        json={"properties": {prop: {"checkbox": True}}},
-                    )
-                    chk.raise_for_status()
+                    await _set_checkbox(client, row_id, prop)
                     checked = prop
 
+        # 무엇을 했는지 + **원래 뭐가 있었는지**를 함께 돌려준다.
+        # 뒤엣것이 핵심이다: 칸 내용을 읽는 도구가 따로 없어서, 이걸 안 주면 모델이
+        # "지금 비어 있어요" 같은 말을 지어낸다 (2026-08-04 실제로 그랬다).
+        if mode == "replace":
+            head = f"{day} '{section}'을 새로 썼어요 ({len(lines)}줄, 이전 {removed}줄은 지웠어요)."
+        elif not lines:
+            head = f"{day} '{section}'에 넣을 게 없었어요 — {skipped}줄 모두 이미 똑같이 적혀 있어요."
+        elif skipped:
+            head = f"{day} '{section}'에 {len(lines)}줄 덧붙였어요 (이미 있던 {skipped}줄은 건너뜀)."
+        else:
+            head = f"{day} '{section}'에 {len(lines)}줄 덧붙였어요."
         if checked:
-            return f"{day} 데일리루틴 '{section}'에 적고 '{checked}' 체크박스를 켰어요."
-        return f"{day} 데일리루틴 '{section}'에 적었어요."
+            head += f" '{checked}' 체크박스도 켰어요."
+
+        if existing:
+            was = "\n".join(existing)
+            if len(was) > 600:  # 모델에 실릴 양을 묶어둔다
+                was = was[:600] + f"\n… (외 {len(existing)}줄 중 일부 생략)"
+            head += f"\n\n[원래 이 칸에 있던 내용]\n{was}"
+        return head
     except httpx.HTTPStatusError as e:
         return f"노션 처리 중 오류 ({e.response.status_code}): {e.response.text[:200]}"
     except Exception as e:  # noqa: BLE001
@@ -627,3 +794,156 @@ async def routine_write(
 
 # agent.py가 가져다 쓰는 도구 목록
 ROUTINE_TOOLS = [routine_today, routine_check, routine_write, attach_routine_photo]
+
+
+def _selftest() -> None:
+    """칸 경계 판정과 중복 제거만 점검한다. 여기가 이 파일의 판단 로직이다.
+
+    네트워크는 타지 않는다 — _blocks_of만 갈아끼운다. 실 노션으로 시험하면
+    남의 행에 쓰레기가 남고, 사진 블록을 지우는 실수는 되돌리기 어렵다.
+    """
+    import asyncio
+
+    def heading(bid, level, text):
+        return {"id": bid, "type": f"heading_{level}", f"heading_{level}": {
+            "rich_text": [{"plain_text": text}]}}
+
+    def para(bid, text):
+        return {"id": bid, "type": "paragraph", "paragraph": {
+            "rich_text": [{"plain_text": text}]}}
+
+    page = [
+        heading("h-회고", 2, "회고"),
+        heading("h-한일", 3, "오늘 한 일"),
+        para("p1", "임베딩 정리"),
+        {"id": "img1", "type": "image", "image": {}},      # 사진 인증
+        para("p2", "검증 데이터 정리"),
+        heading("h-특별", 3, "오늘의 특별한 점"),           # ← 여기서 끊겨야 한다
+        para("p3", "남의 칸 내용"),
+    ]
+
+    global _blocks_of
+    real = _blocks_of
+
+    async def fake(client, block_id):
+        return page
+
+    _blocks_of = fake
+    try:
+        got = asyncio.run(_section_blocks(None, "row", "h-한일"))
+        ids = [b["id"] for b in got]
+        # 다음 헤딩 전까지만. 헤딩 자신도, 다음 칸 내용도 안 들어온다
+        assert ids == ["p1", "img1", "p2"], ids
+        # 마지막 칸은 페이지 끝까지
+        assert [b["id"] for b in asyncio.run(_section_blocks(None, "row", "h-특별"))] == ["p3"]
+        # 없는 헤딩이면 빈 목록 (엉뚱한 걸 지우면 안 된다)
+        assert asyncio.run(_section_blocks(None, "row", "h-없음")) == []
+        assert isinstance(got, list)
+    finally:
+        _blocks_of = real
+
+    # 사진은 문단이 아니다 → replace가 지우면 안 되고, 중복 비교에도 안 낀다
+    assert _paragraph_text(para("x", "글")) == "글"
+    assert _paragraph_text({"id": "i", "type": "image", "image": {}}) is None
+    assert _paragraph_text(heading("h", 2, "회고")) is None
+    assert _paragraph_text(para("y", "")) == ""
+
+    # replace가 실제로 지우는 대상: 글이 든 문단만.
+    # (템플릿이 칸 끝에 두는 빈 문단과 사진은 남아야 한다 — 실 노션에서 확인한 구조)
+    section = [para("p1", "옛 기록"), {"id": "img", "type": "image", "image": {}},
+               para("p2", "   "), para("p3", "합계 5시간")]
+    doomed = [b["id"] for b in section if (_paragraph_text(b) or "").strip()]
+    assert doomed == ["p1", "p3"], doomed
+
+    # --- 노션에서 체크박스 이름을 바꾸면 (2026-08-05 논의) ---------------------
+    # ITEMS는 아가씨 노션 속성 이름의 사본이다. 노션에서 '운동'을 '헬스'로 바꾸면
+    # 400이 나는데, 그대로 흘리면 알아볼 수 없는 답이 나간다.
+    class _FakeResp:
+        def __init__(self, code, body=None):
+            self.status_code, self._body = code, body or {}
+
+        def json(self):
+            return self._body
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise httpx.HTTPStatusError("boom", request=None, response=None)
+
+    class _FakeClient:
+        def __init__(self, boxes):
+            self.boxes = boxes
+
+        async def patch(self, url, **kw):
+            prop = next(iter(kw["json"]["properties"]))
+            return _FakeResp(200 if prop in self.boxes else 400)
+
+        async def get(self, url, **kw):
+            props = {n: {"type": "checkbox"} for n in self.boxes}
+            props["날짜"] = {"type": "date"}  # 체크박스가 아닌 건 목록에서 빠져야 한다
+            return _FakeResp(200, {"properties": props})
+
+    ok = asyncio.run(_set_checkbox(_FakeClient(["운동", "코테"]), "row", "운동"))
+    assert ok is None, ok  # 있으면 조용히 켜고 끝난다
+    try:
+        asyncio.run(_set_checkbox(_FakeClient(["헬스", "코테"]), "row", "운동"))
+        raise AssertionError("없는 항목인데 통과했다")
+    except ItemMissing as e:
+        assert "'운동' 체크박스가 없어요" in str(e), str(e)
+        assert "헬스 / 코테" in str(e) and "날짜" not in str(e), str(e)
+        # 예외 타입 이름이 아가씨께 새면 안 된다 (UserFacing이라 그대로 나간다)
+        shown = context.as_message(e, "노션 처리 중 오류")
+        assert shown.startswith("노션에 '운동'") and "ItemMissing" not in shown, shown
+
+    # 부르는 말이 달라도 같은 항목으로 간다 (2026-08-05: '미라클 모닝'을 못 알아듣고
+    # 모델이 '운동'을 임의로 켰다)
+    for said, want in (
+        ("미라클 모닝", "도착 8시"), ("미라클모닝", "도착 8시"), ("출근", "도착 8시"),
+        ("도착", "도착 8시"), ("도착 8시", "도착 8시"),
+        ("헬스", "운동"), ("운동", "운동"),
+        ("야간자습", "어드민나잇"), ("야자", "어드민나잇"), ("어드민 나잇", "어드민나잇"),
+        ("회화공부", "영어 스피킹"), ("회화 공부", "영어 스피킹"), ("영어", "영어 스피킹"),
+        ("코딩테스트", "코테"), ("코테", "코테"), ("회고", "회고"),
+    ):
+        assert _resolve_item(said) == want, (said, _resolve_item(said))
+
+    # 별칭 키에 공백이 있으면 _norm 때문에 영영 안 걸린다 — 넣을 때 실수하기 쉽다
+    assert all(k == _norm(k) for k in ALIASES), [k for k in ALIASES if k != _norm(k)]
+    assert all(v in ITEMS for v in ALIASES.values()), "없는 항목을 가리키는 별칭이 있다"
+
+    # 그래도 모르는 말은 노션까지 가지 않는다 (비슷한 걸 임의로 켜면 안 된다)
+    assert _resolve_item("명상") is None and _resolve_item("") is None
+
+    # ⚠️ 별칭은 프롬프트에 실려야 쓸모가 있다. 모델은 도구를 부르기 **전에** 판단하므로,
+    #    이 한 줄에서 빠진 별칭은 "그런 항목 없어요"로 막힌다(2026-08-05 '미라클모닝').
+    guide = item_guide()
+    for said in ALIASES:
+        assert said in guide, said
+    for prop in ITEMS.values():
+        assert prop in guide, prop
+    assert guide.count(" / ") == len(ITEMS) - 1, guide  # 항목 여섯 개가 한 줄에
+    assert "회고(" not in guide  # 별칭 없는 항목은 빈 괄호를 달지 않는다
+
+    # ⚠️ 도구 설명문의 예시를 모델은 '가능한 값의 전부'로 읽는다. 회고 아래 세부 칸만
+    #    예로 들었더니 "영어 스피킹 30분 했다"를 회고에 적고, 아가씨껜 "적을 칸이
+    #    없다"고까지 했다(2026-08-05). 항목에도 자기 칸이 있다는 걸 알려야 한다.
+    desc = routine_write.description
+    assert any(prop in desc for prop in ITEMS.values()), desc
+    assert "한 번 불러라" in desc  # 목록을 베끼는 대신 도구에게 물어보게 한다
+
+    # 중복 판정은 _norm 기준 — 공백이 달라도 같은 줄로 본다
+    existing = {_norm(t) for t in ["임베딩 정리", "검증 데이터 정리"]}
+    new = ["임베딩정리", "프로젝트 아키텍쳐 분석 정리", "검증 데이터  정리"]
+    kept = [ln for ln in new if _norm(ln) not in existing]
+    assert kept == ["프로젝트 아키텍쳐 분석 정리"], kept
+
+    # 덧붙이기는 칸의 **끝**에 붙는다. 헤딩에 붙이면 최신이 맨 위로 와서
+    # 회고를 위에서 아래로 읽을 때 시간이 거꾸로 흐른다.
+    assert _append_anchor(section, "h-반성") == "p3"
+    assert _append_anchor([], "h-반성") == "h-반성"  # 칸이 비어 있으면 헤딩 뒤
+    assert isinstance(_append_anchor(section, "h-반성"), str)
+
+    print("selftest OK")
+
+
+if __name__ == "__main__":
+    _selftest()

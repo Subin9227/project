@@ -49,6 +49,13 @@ DATA_DIR.mkdir(exist_ok=True)  # data/ 폴더가 없으면 자동 생성
 # 대화기억(체크포인트)을 저장할 SQLite 파일 경로.
 MEMORY_DB_PATH: Path = DATA_DIR / "memory.sqlite"
 
+# 대화기억을 며칠치 남길지. 봇을 켤 때 이보다 오래된 스레드를 지운다.
+# ⚠️ 0이면 아예 안 지운다. 테스트 기간에는 사용자들의 대화를 하나하나 봐야 해서
+#    0으로 둔다 — 지우면 무슨 일이 있었는지 되짚을 방법이 없다.
+#    (공개 운영으로 넘어가면 다시 7 같은 값으로 되돌릴 것. 남의 대화를 무한정
+#     들고 있는 건 그 자체가 위험이다)
+MEMORY_KEEP_DAYS: int = int(os.getenv("MEMORY_KEEP_DAYS", "7"))
+
 # 사용자별 설정·자격증명 저장소. memory.sqlite와 일부러 파일을 나눈다 —
 # 그쪽은 bot.py가 시작할 때 통째로 DELETE/VACUUM 하고, 스키마 주인도 LangGraph다.
 USERS_DB_PATH: Path = DATA_DIR / "users.sqlite"

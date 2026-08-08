@@ -22,3 +22,7 @@ Pillow>=10.0
 # 상태 서버(/health) — Phase 3 WireShark 캡처용. 봇과 같은 asyncio 루프에서 실행.
 fastapi>=0.110
 uvicorn>=0.30
+
+# 사용자 자격증명 암호화(Fernet). users.py가 함수 안에서 늦게 import하므로,
+# 빠져 있어도 봇은 멀쩡히 뜨고 누군가 /register를 누를 때에야 터진다.
+cryptography>=42.0

@@ -11,7 +11,7 @@
     복사해 가므로 동시에 온 두 사람의 요청이 섞이지 않는다.
     (notion_tools가 쓰는 asyncio.to_thread도 컨텍스트를 복사한다)
 
-    ponytail: 이 방식은 봇이 한 프로세스·한 이벤트루프일 때만 맞다.
+    이 방식은 봇이 한 프로세스·한 이벤트루프일 때만 맞다.
     스레드풀이나 여러 프로세스로 가면 깨진다 — 그때는 도구마다
     `config: RunnableConfig`를 받아 LangGraph의 configurable에서 꺼내야 한다.
 

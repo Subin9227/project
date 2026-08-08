@@ -212,7 +212,7 @@ _TOOLS = [_tagged(t) for t in ROUTINE_TOOLS + HOMEWORK_TOOLS + BLAYBUS_TOOLS]
 
 # 모델이 같으면 그래프도 같으니 재사용한다. 열쇠는 '뇌의 생김새'다.
 # MCP를 걷어낸 덕분에 그래프 하나에 node 프로세스가 딸려오지 않아 가볍다.
-# ponytail: 상한 없음. 등록자가 수백 명이 되면 LRU로 바꾼다.
+# 상한 없음. 등록자가 수백 명이 되면 LRU로 바꾼다.
 _agents: dict[tuple, object] = {}
 
 

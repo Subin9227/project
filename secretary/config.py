@@ -97,15 +97,14 @@ WEEKLY_TIME: str = os.getenv("WEEKLY_TIME", "MON 08:00")
 # ("비서 전용 페이지" 안의 깨끗한 전용 DB. 하루 1행, 스키마는 옛 DB와 동일.)
 # 워크스페이스를 새로 만들면 바뀔 수 있으므로 여기서 한 곳에서 관리한다.
 # (옛 "오프라인 데일리 루틴" = df10ffe9-306d-834e-bae9-0717212de385)
-NOTION_ROUTINE_DS_ID: str = os.getenv(
-    "NOTION_ROUTINE_DS_ID", "a5a0ffe9-306d-82c0-b5df-07a9145e578b"
-)
+# ⚠️ 기본값을 두지 않는다. 특정인의 워크스페이스 주소가 기본값이면, .env에 이 줄을
+#    빠뜨린 사람이 남의 표로 요청을 보내고 권한 오류만 받는다 — 본인 노션은 멀쩡한데
+#    원인을 찾을 길이 없다. 비어 있으면 context.require()가 등록 안내를 낸다.
+NOTION_ROUTINE_DS_ID: str = os.getenv("NOTION_ROUTINE_DS_ID", "")
 
 # "과제 제출 (2)" 데이터소스 ID. 루틴 DB와 같은 페이지에 들어있는 별개 DB.
 # 주차별 1행. 내용(과제 결과·회고)은 사람이 쓰고, 봇은 틀을 깔고 상태만 옮긴다.
-NOTION_HOMEWORK_DS_ID: str = os.getenv(
-    "NOTION_HOMEWORK_DS_ID", "f8a0ffe9-306d-8267-8473-8765b724ec67"
-)
+NOTION_HOMEWORK_DS_ID: str = os.getenv("NOTION_HOMEWORK_DS_ID", "")
 
 # 노션 REST API를 직접 호출할 때 쓰는 상수.
 # (MCP 서버를 걷어내고 필요한 것만 직접 부른다 — #9 Phase 1)
